@@ -37,7 +37,9 @@ logger = logging.getLogger("botlog")
 logger.setLevel(logging.INFO)
 
 if not logger.handlers:
-    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+    file_handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
+    )
     file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(file_handler)
 
@@ -142,10 +144,16 @@ def normalize_settings(data: dict) -> dict:
 ADMIN_USER_IDS = load_admins()
 settings_data = normalize_settings(load_settings())
 
+# =========================
+# ADMINS name cache (anti-freeze)
+# =========================
+_admins_cache: dict[int, str] = {}
+_admins_cache_ts: float = 0.0
+ADMINS_CACHE_TTL_SECONDS = 3600  # 1 час
+
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 router = Router()
-
 
 # =========================
 # STATES
@@ -306,7 +314,6 @@ async def do_ban(message: Message, reason: str):
                 f"Чат: <code>{chat_id}</code>",
             )
         except TelegramBadRequest:
-            # часто "chat not found" или бот не может начать диалог
             continue
         except Exception:
             continue
@@ -349,27 +356,45 @@ def _status_label() -> str:
 
 
 async def format_admins_list(limit: int = 50) -> str:
-    lines = []
+    """
+    Anti-freeze:
+    - кэш имён
+    - максимум 8 get_chat на один callback
+    - wait_for таймаут
+    """
+    global _admins_cache, _admins_cache_ts
+
+    now_ts = datetime.now().timestamp()
+    if not _admins_cache or (now_ts - _admins_cache_ts) > ADMINS_CACHE_TTL_SECONDS:
+        _admins_cache = {}
+        _admins_cache_ts = now_ts
+
     if not ADMIN_USER_IDS:
         return "Список админов пуст."
 
-    for i, uid in enumerate(ADMIN_USER_IDS[:limit], start=1):
-        name = "—"
-        try:
-            chat = await bot.get_chat(uid)
-            # chat может быть User
-            title = getattr(chat, "full_name", None) or getattr(chat, "first_name", None)
-            if title:
-                name = title
-            else:
-                uname = getattr(chat, "username", None)
-                if uname:
-                    name = f"@{uname}"
-        except Exception:
-            # если бот не может получить информацию — оставим только ID
-            pass
+    hard_limit = min(limit, 8)
+    lines: list[str] = []
+
+    for i, uid in enumerate(ADMIN_USER_IDS[:hard_limit], start=1):
+        name = _admins_cache.get(uid)
+        if not name:
+            try:
+                chat = await asyncio.wait_for(bot.get_chat(uid), timeout=4.0)
+                title = getattr(chat, "full_name", None) or getattr(chat, "first_name", None)
+                if title:
+                    name = title
+                else:
+                    uname = getattr(chat, "username", None)
+                    name = f"@{uname}" if uname else "—"
+            except Exception:
+                name = "—"
+            _admins_cache[uid] = name
 
         lines.append(f"{i}. <code>{uid}</code> — {name}")
+
+    total = len(ADMIN_USER_IDS)
+    if total > hard_limit:
+        lines.append(f"… и ещё {total - hard_limit} админ(ов) (показываю первые {hard_limit}).")
 
     return "\n".join(lines)
 
@@ -380,19 +405,20 @@ def build_admin_panel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"Статус: {_status_label()}", callback_data="admin:noop")],
-            [InlineKeyboardButton(text=f"Интервал: {settings_data['work_start']}–{settings_data['work_end']}", callback_data="admin:work_info")],
+            [
+                InlineKeyboardButton(
+                    text=f"Интервал: {settings_data['work_start']}–{settings_data['work_end']}",
+                    callback_data="admin:work_info",
+                )
+            ],
             [InlineKeyboardButton(text=f"{_mode_label()}", callback_data="admin:mode_info")],
             [
                 InlineKeyboardButton(text="−1c", callback_data="admin:delay_minus"),
                 InlineKeyboardButton(text=f"Задержка: {delay}с", callback_data="admin:delay_info"),
                 InlineKeyboardButton(text="+1c", callback_data="admin:delay_plus"),
             ],
-            [
-                InlineKeyboardButton(text="📝 Тексты", callback_data="admin:view_texts"),
-            ],
-            [
-                InlineKeyboardButton(text="👮 Админы", callback_data="admin:view_admins"),
-            ],
+            [InlineKeyboardButton(text="📝 Тексты", callback_data="admin:view_texts")],
+            [InlineKeyboardButton(text="👮 Админы", callback_data="admin:view_admins")],
             [
                 InlineKeyboardButton(text="✏️ Приветствие", callback_data="admin:edit_welcome"),
                 InlineKeyboardButton(text="✏️ Согласие", callback_data="admin:edit_consent"),
@@ -413,9 +439,7 @@ def build_admin_panel() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🔔 Оповещения", callback_data="admin:edit_notify_admins"),
                 InlineKeyboardButton(text="⚙️ Уровень", callback_data="admin:edit_mode"),
             ],
-            [
-                InlineKeyboardButton(text="🟣 Toggle is_active", callback_data="admin:toggle_active"),
-            ],
+            [InlineKeyboardButton(text="🟣 Toggle is_active", callback_data="admin:toggle_active")],
             [InlineKeyboardButton(text="🧾 Логи (/botlog)", callback_data="admin:noop")],
         ]
     )
@@ -466,27 +490,33 @@ async def cb_noop(call: CallbackQuery):
 async def cb_view_admins(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         return
+
+    # ✅ важно: отвечаем сразу, чтобы callback не "завис"
+    await call.answer()
+
     admins_text = await format_admins_list()
+
     await state.clear()
     try:
         await call.message.edit_text(
             "👮 <b>Админы бота</b>\n\n"
-            "Формат: номер. <code>ID</code> — имя/ник (если удалось определить)\n\n"
+            "Формат: номер. <code>ID</code> — имя/ник\n\n"
             f"<pre>{admins_text}</pre>",
             reply_markup=back_to_panel_kb(),
         )
     except Exception:
         pass
-    await call.answer()
 
 
 @router.callback_query(F.data == "admin:view_texts")
 async def cb_view_texts(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         return
+
+    await call.answer()
+
     texts = get_texts()
 
-    # красивый вывод, но без слишком длинного сообщения
     def fmt_block(key: str, value: str) -> str:
         v = (value or "").strip()
         if len(v) > 1200:
@@ -506,7 +536,6 @@ async def cb_view_texts(call: CallbackQuery, state: FSMContext):
         await call.message.edit_text(body, reply_markup=back_to_panel_kb())
     except Exception:
         pass
-    await call.answer()
 
 
 @router.callback_query(F.data == "admin:toggle_active")
@@ -784,6 +813,7 @@ async def cb_remove_admin(call: CallbackQuery, state: FSMContext):
 
 @router.message(AdminEdit.adding_admin)
 async def adding_admin_handler(message: Message, state: FSMContext):
+    global _admins_cache_ts, _admins_cache
     if not is_admin(message.from_user.id):
         return
     try:
@@ -800,12 +830,17 @@ async def adding_admin_handler(message: Message, state: FSMContext):
     ADMIN_USER_IDS.append(uid)
     save_admins(ADMIN_USER_IDS)
 
+    # сброс кэша имён
+    _admins_cache = {}
+    _admins_cache_ts = 0.0
+
     await state.clear()
     await message.answer("✅ Админ добавлен.", reply_markup=build_admin_panel())
 
 
 @router.message(AdminEdit.removing_admin)
 async def removing_admin_handler(message: Message, state: FSMContext):
+    global _admins_cache_ts, _admins_cache
     if not is_admin(message.from_user.id):
         return
     try:
@@ -821,6 +856,10 @@ async def removing_admin_handler(message: Message, state: FSMContext):
 
     ADMIN_USER_IDS[:] = [x for x in ADMIN_USER_IDS if x != uid]
     save_admins(ADMIN_USER_IDS)
+
+    # сброс кэша имён
+    _admins_cache = {}
+    _admins_cache_ts = 0.0
 
     await state.clear()
     await message.answer("✅ Админ удалён.", reply_markup=build_admin_panel())
@@ -874,8 +913,7 @@ async def botlog_cmd(message: Message):
         return
     log_text = read_last_lines(LOG_FILE, n=160)
     await message.answer(
-        "📋 <b>Логи бота</b>\n\n"
-        f"<pre>{safe_truncate(log_text)}</pre>"
+        "📋 <b>Логи бота</b>\n\n" f"<pre>{safe_truncate(log_text)}</pre>"
     )
 
 
@@ -923,9 +961,7 @@ async def process_age(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    await botlog(
-        f"AGE step user_id={message.from_user.id} chat_id={message.chat.id}"
-    )
+    await botlog(f"AGE step user_id={message.from_user.id} chat_id={message.chat.id}")
 
     if await maybe_ban_on_suspicious_links(message):
         await state.clear()
@@ -951,7 +987,7 @@ async def process_age(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    if is_mode_1():
+    if int(settings_data.get("mode", 2)) == 1:
         await state.clear()
         return
 
@@ -961,10 +997,6 @@ async def process_age(message: Message, state: FSMContext):
     await botlog(f"CONSENT sent age={age} user_id={message.from_user.id}")
 
 
-def is_mode_1():
-    return int(settings_data.get("mode", 2)) == 1
-
-
 @router.message(Onboarding.waiting_for_consent, F.text)
 async def process_consent(message: Message, state: FSMContext):
     if not bot_is_running_for_welcome():
@@ -972,9 +1004,7 @@ async def process_consent(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    await botlog(
-        f"CONSENT step user_id={message.from_user.id} chat_id={message.chat.id}"
-    )
+    await botlog(f"CONSENT step user_id={message.from_user.id} chat_id={message.chat.id}")
 
     if await maybe_ban_on_suspicious_links(message):
         await state.clear()
