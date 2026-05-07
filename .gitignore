@@ -1,0 +1,4 @@
+.env
+*.env
+settings.json
+admins.json
