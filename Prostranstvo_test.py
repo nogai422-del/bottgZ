@@ -31,7 +31,7 @@ SETTINGS_FILE = "settings.json"
 LOG_FILE = "bot.log"
 
 # =========================
-# LOGGING
+# LOGGING (для админов)
 # =========================
 logger = logging.getLogger("botlog")
 logger.setLevel(logging.INFO)
@@ -78,7 +78,6 @@ _DEFAULT_SETTINGS = {
     "notify_admins": [ADMIN_CHAT_ID],
     "texts": _DEFAULT_TEXTS,
 }
-
 
 # =========================
 # FILE HELPERS
@@ -131,7 +130,6 @@ def normalize_settings(data: dict) -> dict:
         s["notify_admins"] = [ADMIN_CHAT_ID]
 
     s["notify_admins"] = [int(x) for x in s["notify_admins"]]
-
     s["mode"] = int(s.get("mode", 2))
     s["reply_delay"] = int(s.get("reply_delay", 1))
     s["is_active"] = bool(s.get("is_active", True))
@@ -144,10 +142,7 @@ def normalize_settings(data: dict) -> dict:
 ADMIN_USER_IDS = load_admins()
 settings_data = normalize_settings(load_settings())
 
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode="HTML"),
-)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 router = Router()
 
@@ -210,33 +205,19 @@ def bot_is_off_by_time() -> bool:
     now = datetime.now().time()
     if start <= end:
         return not (start <= now <= end)
-    return not (now >= start or now <= end)  # пересечение через полночь
-
-
-def is_mode_0():
-    return int(settings_data.get("mode", 2)) == 0
-
-
-def is_mode_1():
-    return int(settings_data.get("mode", 2)) == 1
-
-
-def is_mode_2():
-    return int(settings_data.get("mode", 2)) == 2
+    return not (now >= start or now <= end)
 
 
 def bot_is_running_for_welcome():
     if bot_is_off_by_time():
         return False
-    if is_mode_0():
-        return False
-    return True
+    return int(settings_data.get("mode", 2)) != 0
 
 
 def bot_is_running_for_questionnaire():
     if bot_is_off_by_time():
         return False
-    return is_mode_2()
+    return int(settings_data.get("mode", 2)) == 2
 
 
 def get_texts():
@@ -285,10 +266,15 @@ async def do_ban(message: Message, reason: str):
     # delete best-effort
     try:
         await message.delete()
-        await botlog(f"DELETE ok message_id={message.message_id} chat_id={chat_id} user_id={user_id}")
+        await botlog(
+            f"DELETE ok message_id={message.message_id} chat_id={chat_id} user_id={user_id}"
+        )
     except Exception as e:
-        await botlog(f"DELETE failed message_id={message.message_id} err={repr(e)}")
+        await botlog(
+            f"DELETE failed message_id={message.message_id} chat_id={chat_id} user_id={user_id} err={repr(e)}"
+        )
 
+    # ban
     try:
         await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
         await botlog(f"BAN ok chat_id={chat_id} user_id={user_id}")
@@ -296,14 +282,18 @@ async def do_ban(message: Message, reason: str):
         await botlog(f"BAN failed chat_id={chat_id} user_id={user_id} err={repr(e)}")
         return
 
-    # delete again best-effort
+    # delete again
     try:
         await message.delete()
-        await botlog(f"DELETE(2) ok message_id={message.message_id} chat_id={chat_id} user_id={user_id}")
+        await botlog(
+            f"DELETE(2) ok message_id={message.message_id} chat_id={chat_id} user_id={user_id}"
+        )
     except Exception as e:
-        await botlog(f"DELETE(2) failed message_id={message.message_id} err={repr(e)}")
+        await botlog(
+            f"DELETE(2) failed message_id={message.message_id} chat_id={chat_id} user_id={user_id} err={repr(e)}"
+        )
 
-    # notify admins best-effort (ошибки игнорируем)
+    # notify admins list
     profile_link = f'<a href="tg://user?id={user_id}">профиль</a>'
     for admin_id in get_notify_admins():
         try:
@@ -315,14 +305,10 @@ async def do_ban(message: Message, reason: str):
                 f"Причина: {reason}\n"
                 f"Чат: <code>{chat_id}</code>",
             )
-            await botlog(f"ADMIN notify ok admin_id={admin_id} banned_user_id={user_id}")
-        except TelegramBadRequest as e:
-            msg = str(e).lower()
-            await botlog(f"ADMIN notify bad admin_id={admin_id} err={repr(e)}")
-            if "chat not found" in msg or "bot can't initiate conversation" in msg:
-                continue
-        except Exception as e:
-            await botlog(f"ADMIN notify failed admin_id={admin_id} err={repr(e)}")
+        except TelegramBadRequest:
+            # часто "chat not found" или бот не может начать диалог
+            continue
+        except Exception:
             continue
 
 
@@ -330,71 +316,107 @@ async def maybe_ban_on_suspicious_links(message: Message) -> bool:
     raw_text = (message.text or "") or (message.caption or "")
     if not raw_text:
         return False
-
     if not is_suspicious_text(raw_text):
         return False
 
     await botlog(
-        f"DETECT suspicious user_id={message.from_user.id} chat_id={message.chat.id} "
-        f"text={raw_text[:220]!r}"
+        f"DETECT suspicious user_id={message.from_user.id} chat_id={message.chat.id} text={raw_text[:220]!r}"
     )
     await do_ban(message, "Подозрительные ссылки/@")
     return True
 
 
 # =========================
-# ADMIN PANEL
+# ADMIN PANEL (красиво + список админов + тексты)
 # =========================
 def back_to_panel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="Назад к панели", callback_data="admin:panel")]]
+        inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="admin:panel")]]
     )
+
+
+def _mode_label() -> str:
+    m = int(settings_data.get("mode", 2))
+    return "Уровень 0" if m == 0 else "Уровень 1" if m == 1 else "Уровень 2"
+
+
+def _status_label() -> str:
+    active = settings_data.get("is_active", True)
+    off_by_time = bot_is_off_by_time()
+    if active and not off_by_time:
+        return "🟢 Включен"
+    return "🔴 Выключен/время off"
+
+
+async def format_admins_list(limit: int = 50) -> str:
+    lines = []
+    if not ADMIN_USER_IDS:
+        return "Список админов пуст."
+
+    for i, uid in enumerate(ADMIN_USER_IDS[:limit], start=1):
+        name = "—"
+        try:
+            chat = await bot.get_chat(uid)
+            # chat может быть User
+            title = getattr(chat, "full_name", None) or getattr(chat, "first_name", None)
+            if title:
+                name = title
+            else:
+                uname = getattr(chat, "username", None)
+                if uname:
+                    name = f"@{uname}"
+        except Exception:
+            # если бот не может получить информацию — оставим только ID
+            pass
+
+        lines.append(f"{i}. <code>{uid}</code> — {name}")
+
+    return "\n".join(lines)
 
 
 def build_admin_panel() -> InlineKeyboardMarkup:
     delay = settings_data.get("reply_delay", 1)
-    mode = int(settings_data.get("mode", 2))
-    mode_label = "Уровень 0" if mode == 0 else "Уровень 1" if mode == 1 else "Уровень 2"
-    status = "Включен" if (settings_data.get("is_active", True) and not bot_is_off_by_time()) else "Выключен/время off"
-    work = f"{settings_data['work_start']} - {settings_data['work_end']}"
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=f"Статус: {status}", callback_data="admin:noop")],
+            [InlineKeyboardButton(text=f"Статус: {_status_label()}", callback_data="admin:noop")],
+            [InlineKeyboardButton(text=f"Интервал: {settings_data['work_start']}–{settings_data['work_end']}", callback_data="admin:work_info")],
+            [InlineKeyboardButton(text=f"{_mode_label()}", callback_data="admin:mode_info")],
             [
-                InlineKeyboardButton(text="−1с", callback_data="admin:delay_minus"),
-                InlineKeyboardButton(text=f"Задержка: {delay} сек", callback_data="admin:delay_info"),
-                InlineKeyboardButton(text="+1с", callback_data="admin:delay_plus"),
-            ],
-            [InlineKeyboardButton(text=work, callback_data="admin:work_info")],
-            [InlineKeyboardButton(text=f"{mode_label}", callback_data="admin:mode_info")],
-            [
-                InlineKeyboardButton(text="Старт", callback_data="admin:edit_work_start"),
-                InlineKeyboardButton(text="Конец", callback_data="admin:edit_work_end"),
+                InlineKeyboardButton(text="−1c", callback_data="admin:delay_minus"),
+                InlineKeyboardButton(text=f"Задержка: {delay}с", callback_data="admin:delay_info"),
+                InlineKeyboardButton(text="+1c", callback_data="admin:delay_plus"),
             ],
             [
-                InlineKeyboardButton(text="Назначить админа", callback_data="admin:add_admin"),
-                InlineKeyboardButton(text="Убрать админа", callback_data="admin:remove_admin"),
-            ],
-            [InlineKeyboardButton(text="Админы оповещений", callback_data="admin:edit_notify_admins")],
-            [
-                InlineKeyboardButton(text="Изменить приветствие", callback_data="admin:edit_welcome"),
-                InlineKeyboardButton(text="Изменить согласие", callback_data="admin:edit_consent"),
+                InlineKeyboardButton(text="📝 Тексты", callback_data="admin:view_texts"),
             ],
             [
-                InlineKeyboardButton(text="Изменить текст анкеты", callback_data="admin:edit_questionnaire"),
-                InlineKeyboardButton(text="Изменить текст отказа", callback_data="admin:edit_decline"),
+                InlineKeyboardButton(text="👮 Админы", callback_data="admin:view_admins"),
             ],
             [
-                InlineKeyboardButton(text="Изменить уровень (0/1/2)", callback_data="admin:edit_mode"),
-                InlineKeyboardButton(text="Состояние is_active", callback_data="admin:toggle_active"),
+                InlineKeyboardButton(text="✏️ Приветствие", callback_data="admin:edit_welcome"),
+                InlineKeyboardButton(text="✏️ Согласие", callback_data="admin:edit_consent"),
             ],
             [
-                InlineKeyboardButton(text="Посмотреть логи (/botlog)", callback_data="admin:noop"),
+                InlineKeyboardButton(text="✏️ Анкета", callback_data="admin:edit_questionnaire"),
+                InlineKeyboardButton(text="✏️ Отказ", callback_data="admin:edit_decline"),
             ],
             [
-                InlineKeyboardButton(text="Рестарт не нужен", callback_data="admin:noop"),
+                InlineKeyboardButton(text="⏱ Старт", callback_data="admin:edit_work_start"),
+                InlineKeyboardButton(text="⏱ Конец", callback_data="admin:edit_work_end"),
             ],
+            [
+                InlineKeyboardButton(text="➕ Админ", callback_data="admin:add_admin"),
+                InlineKeyboardButton(text="➖ Убрать", callback_data="admin:remove_admin"),
+            ],
+            [
+                InlineKeyboardButton(text="🔔 Оповещения", callback_data="admin:edit_notify_admins"),
+                InlineKeyboardButton(text="⚙️ Уровень", callback_data="admin:edit_mode"),
+            ],
+            [
+                InlineKeyboardButton(text="🟣 Toggle is_active", callback_data="admin:toggle_active"),
+            ],
+            [InlineKeyboardButton(text="🧾 Логи (/botlog)", callback_data="admin:noop")],
         ]
     )
 
@@ -405,9 +427,12 @@ async def admin_panel(message: Message, state: FSMContext):
         return
     await state.clear()
     await message.answer(
-        "Панель управления ботом\n\n"
-        f"Интервал: {settings_data['work_start']} - {settings_data['work_end']}\n"
-        f"Уровень: {settings_data.get('mode', 2)}",
+        "⚙️ <b>Панель управления ботом</b>\n\n"
+        f"• {_status_label()}\n"
+        f"• Уровень: <code>{settings_data.get('mode', 2)}</code>\n"
+        f"• Интервал: <code>{settings_data['work_start']}–{settings_data['work_end']}</code>\n"
+        f"• Задержка: <code>{settings_data.get('reply_delay', 1)}</code> сек\n\n"
+        "Выбирай действие ниже:",
         reply_markup=build_admin_panel(),
     )
 
@@ -419,17 +444,68 @@ async def cb_back_to_panel(call: CallbackQuery, state: FSMContext):
     await state.clear()
     try:
         await call.message.edit_text(
-            "Панель управления ботом\n\n"
-            f"Интервал: {settings_data['work_start']} - {settings_data['work_end']}\n"
-            f"Уровень: {settings_data.get('mode', 2)}",
+            "⚙️ <b>Панель управления ботом</b>\n\n"
+            f"• {_status_label()}\n"
+            f"• Уровень: <code>{settings_data.get('mode', 2)}</code>\n"
+            f"• Интервал: <code>{settings_data['work_start']}–{settings_data['work_end']}</code>\n"
+            f"• Задержка: <code>{settings_data.get('reply_delay', 1)}</code> сек\n\n"
+            "Выбирай действие ниже:",
             reply_markup=build_admin_panel(),
         )
     except Exception:
         pass
+    await call.answer()
 
 
 @router.callback_query(F.data == "admin:noop")
 async def cb_noop(call: CallbackQuery):
+    await call.answer()
+
+
+@router.callback_query(F.data == "admin:view_admins")
+async def cb_view_admins(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    admins_text = await format_admins_list()
+    await state.clear()
+    try:
+        await call.message.edit_text(
+            "👮 <b>Админы бота</b>\n\n"
+            "Формат: номер. <code>ID</code> — имя/ник (если удалось определить)\n\n"
+            f"<pre>{admins_text}</pre>",
+            reply_markup=back_to_panel_kb(),
+        )
+    except Exception:
+        pass
+    await call.answer()
+
+
+@router.callback_query(F.data == "admin:view_texts")
+async def cb_view_texts(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    texts = get_texts()
+
+    # красивый вывод, но без слишком длинного сообщения
+    def fmt_block(key: str, value: str) -> str:
+        v = (value or "").strip()
+        if len(v) > 1200:
+            v = v[:1200] + "…"
+        return f"• <code>{key}</code>\n{v}\n"
+
+    body = (
+        "📝 <b>Тексты и заготовки</b>\n\n"
+        + fmt_block("welcome_text", texts.get("welcome_text", ""))
+        + fmt_block("consent_text", texts.get("consent_text", ""))
+        + fmt_block("questionnaire_text", texts.get("questionnaire_text", ""))
+        + fmt_block("decline_text", texts.get("decline_text", ""))
+    )
+
+    await state.clear()
+    try:
+        await call.message.edit_text(body, reply_markup=back_to_panel_kb())
+    except Exception:
+        pass
     await call.answer()
 
 
@@ -493,24 +569,12 @@ async def cb_mode_info(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminEdit.setting_mode)
     await call.answer()
     await call.message.edit_text(
-        "Уровень работы бота\n\n"
+        "🎚️ <b>Уровень работы бота</b>\n\n"
         "0 — бот выключен\n"
         "1 — спрашивает только возраст\n"
         "2 — выполняет все шаги\n\n"
         f"Текущий: <code>{settings_data.get('mode', 2)}</code>\n\n"
-        "Отправь 0/1/2.",
-        reply_markup=back_to_panel_kb(),
-    )
-
-
-@router.callback_query(F.data == "admin:edit_mode")
-async def cb_edit_mode(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    await state.set_state(AdminEdit.setting_mode)
-    await call.answer()
-    await call.message.edit_text(
-        "Изменение уровня.\n\nОтправь 0/1/2",
+        "Отправь: 0 / 1 / 2",
         reply_markup=back_to_panel_kb(),
     )
 
@@ -529,60 +593,6 @@ async def set_mode(message: Message, state: FSMContext):
     await message.answer("✅ Уровень обновлён.", reply_markup=build_admin_panel())
 
 
-@router.callback_query(F.data == "admin:edit_work_start")
-async def cb_edit_work_start(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    await state.set_state(AdminEdit.editing_work_start)
-    await call.answer()
-    await call.message.edit_text(
-        "Введи время STАРТА работы в формате HH:MM (например 22:00)",
-        reply_markup=back_to_panel_kb(),
-    )
-
-
-@router.callback_query(F.data == "admin:edit_work_end")
-async def cb_edit_work_end(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    await state.set_state(AdminEdit.editing_work_end)
-    await call.answer()
-    await call.message.edit_text(
-        "Введи время КОНЦА работы в формате HH:MM (например 06:00)",
-        reply_markup=back_to_panel_kb(),
-    )
-
-
-@router.message(AdminEdit.editing_work_start)
-async def set_work_start(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        parse_hhmm(message.text or "")
-    except Exception as e:
-        await message.answer(f"Ошибка: {e}")
-        return
-    settings_data["work_start"] = (message.text or "").strip()
-    persist_all()
-    await state.clear()
-    await message.answer("✅ Старт обновлён.", reply_markup=build_admin_panel())
-
-
-@router.message(AdminEdit.editing_work_end)
-async def set_work_end(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        parse_hhmm(message.text or "")
-    except Exception as e:
-        await message.answer(f"Ошибка: {e}")
-        return
-    settings_data["work_end"] = (message.text or "").strip()
-    persist_all()
-    await state.clear()
-    await message.answer("✅ Конец обновлён.", reply_markup=build_admin_panel())
-
-
 # ===== Edit texts =====
 @router.callback_query(F.data == "admin:edit_welcome")
 async def cb_edit_welcome(call: CallbackQuery, state: FSMContext):
@@ -591,7 +601,9 @@ async def cb_edit_welcome(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminEdit.editing_welcome)
     await call.answer()
     await call.message.edit_text(
-        "Редактирование приветствия.\nОтправь новый текст.\nПлейсхолдер: {name}",
+        "✏️ <b>Редактирование приветствия</b>\n\n"
+        "Отправь новый текст.\n"
+        "Плейсхолдеры: {name}",
         reply_markup=back_to_panel_kb(),
     )
 
@@ -603,7 +615,9 @@ async def cb_edit_consent(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminEdit.editing_consent)
     await call.answer()
     await call.message.edit_text(
-        "Редактирование согласия.\nОтправь новый текст.\nПлейсхолдер: {age}",
+        "✏️ <b>Редактирование согласия</b>\n\n"
+        "Отправь новый текст.\n"
+        "Плейсхолдеры: {age}",
         reply_markup=back_to_panel_kb(),
     )
 
@@ -615,7 +629,8 @@ async def cb_edit_questionnaire(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminEdit.editing_questionnaire)
     await call.answer()
     await call.message.edit_text(
-        "Редактирование анкеты.\nОтправь новый текст.",
+        "✏️ <b>Редактирование текста анкеты</b>\n\n"
+        "Отправь новый текст.",
         reply_markup=back_to_panel_kb(),
     )
 
@@ -627,7 +642,8 @@ async def cb_edit_decline(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminEdit.editing_decline)
     await call.answer()
     await call.message.edit_text(
-        "Редактирование отказа.\nОтправь новый текст.",
+        "✏️ <b>Редактирование текста отказа</b>\n\n"
+        "Отправь новый текст.",
         reply_markup=back_to_panel_kb(),
     )
 
@@ -672,7 +688,64 @@ async def save_decline(message: Message, state: FSMContext):
     await message.answer("✅ Отказ обновлён.", reply_markup=build_admin_panel())
 
 
-# ===== Admins management (simple: ID/username input) =====
+# ===== Work times =====
+@router.callback_query(F.data == "admin:edit_work_start")
+async def cb_edit_work_start(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminEdit.editing_work_start)
+    await call.answer()
+    await call.message.edit_text(
+        "⏱ <b>Редактирование времени СТАРТА</b>\n\n"
+        "Отправь HH:MM (например 22:00).",
+        reply_markup=back_to_panel_kb(),
+    )
+
+
+@router.callback_query(F.data == "admin:edit_work_end")
+async def cb_edit_work_end(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminEdit.editing_work_end)
+    await call.answer()
+    await call.message.edit_text(
+        "⏱ <b>Редактирование времени КОНЦА</b>\n\n"
+        "Отправь HH:MM (например 06:00).",
+        reply_markup=back_to_panel_kb(),
+    )
+
+
+@router.message(AdminEdit.editing_work_start)
+async def set_work_start(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        parse_hhmm(message.text or "")
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+        return
+    settings_data["work_start"] = (message.text or "").strip()
+    persist_all()
+    await state.clear()
+    await message.answer("✅ Старт обновлён.", reply_markup=build_admin_panel())
+
+
+@router.message(AdminEdit.editing_work_end)
+async def set_work_end(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        parse_hhmm(message.text or "")
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+        return
+    settings_data["work_end"] = (message.text or "").strip()
+    persist_all()
+    await state.clear()
+    await message.answer("✅ Конец обновлён.", reply_markup=build_admin_panel())
+
+
+# ===== Admin management (ID/username) =====
 async def resolve_user_id(query: str) -> int:
     q = (query or "").strip()
     if re.fullmatch(r"\d+", q):
@@ -690,7 +763,8 @@ async def cb_add_admin(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminEdit.adding_admin)
     await call.answer()
     await call.message.edit_text(
-        "Назначить админа.\nПришли ID или username (пример: 12345 или @username)",
+        "➕ <b>Добавить админа</b>\n\n"
+        "Отправь ID или username (например: 12345 или @username).",
         reply_markup=back_to_panel_kb(),
     )
 
@@ -702,7 +776,8 @@ async def cb_remove_admin(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminEdit.removing_admin)
     await call.answer()
     await call.message.edit_text(
-        "Убрать админа.\nПришли ID или username (пример: 12345 или @username)",
+        "➖ <b>Убрать админа</b>\n\n"
+        "Отправь ID или username (например: 12345 или @username).",
         reply_markup=back_to_panel_kb(),
     )
 
@@ -716,12 +791,15 @@ async def adding_admin_handler(message: Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ Не могу определить пользователя: {e}")
         return
+
     if uid in ADMIN_USER_IDS:
         await message.answer("Этот пользователь уже админ.")
         await state.clear()
         return
+
     ADMIN_USER_IDS.append(uid)
     save_admins(ADMIN_USER_IDS)
+
     await state.clear()
     await message.answer("✅ Админ добавлен.", reply_markup=build_admin_panel())
 
@@ -735,20 +813,20 @@ async def removing_admin_handler(message: Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ Не могу определить пользователя: {e}")
         return
-    if uid == message.from_user.id:
-        await message.answer("Нельзя убрать самого себя.")
-        return
+
     if uid not in ADMIN_USER_IDS:
         await message.answer("Этот пользователь не админ.")
         await state.clear()
         return
+
     ADMIN_USER_IDS[:] = [x for x in ADMIN_USER_IDS if x != uid]
     save_admins(ADMIN_USER_IDS)
+
     await state.clear()
     await message.answer("✅ Админ удалён.", reply_markup=build_admin_panel())
 
 
-# ===== notify admins =====
+# ===== notify admins list =====
 @router.callback_query(F.data == "admin:edit_notify_admins")
 async def cb_edit_notify_admins(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
@@ -756,7 +834,9 @@ async def cb_edit_notify_admins(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminEdit.setting_notify_admins)
     await call.answer()
     await call.message.edit_text(
-        "Админы оповещений.\nПришли ID или username (например @user).\nПовтор — уберёт из списка.",
+        "🔔 <b>Админы оповещений</b>\n\n"
+        "Пришли ID или username.\n"
+        "Повтор — уберёт из списка.",
         reply_markup=back_to_panel_kb(),
     )
 
@@ -777,7 +857,7 @@ async def setting_notify_admins_handler(message: Message, state: FSMContext):
     else:
         cur.add(uid)
 
-    if len(cur) == 0:
+    if not cur:
         await message.answer("❌ Список не может быть пустым.")
         return
 
@@ -787,9 +867,7 @@ async def setting_notify_admins_handler(message: Message, state: FSMContext):
     await message.answer("✅ Список обновлён.", reply_markup=build_admin_panel())
 
 
-# =========================
-# LOGGING COMMANDS
-# =========================
+# ===== Botlog commands =====
 @router.message(Command("botlog"))
 async def botlog_cmd(message: Message):
     if not is_admin(message.from_user.id):
@@ -812,7 +890,7 @@ async def botlog_clear_cmd(message: Message):
 
 
 # =========================
-# MAIN SCENARIO
+# USER SCENARIO
 # =========================
 @router.message(F.new_chat_members)
 async def welcome_new_member(message: Message):
@@ -835,7 +913,6 @@ async def welcome_new_member(message: Message):
             key=StorageKey(bot_id=bot.id, chat_id=message.chat.id, user_id=new_member.id),
         )
         await user_state.set_state(Onboarding.waiting_for_age)
-
         await botlog(f"WELCOME sent user_id={new_member.id} chat_id={message.chat.id}")
 
 
@@ -846,7 +923,9 @@ async def process_age(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    await botlog(f"AGE step user_id={message.from_user.id} chat_id={message.chat.id}")
+    await botlog(
+        f"AGE step user_id={message.from_user.id} chat_id={message.chat.id}"
+    )
 
     if await maybe_ban_on_suspicious_links(message):
         await state.clear()
@@ -874,13 +953,16 @@ async def process_age(message: Message, state: FSMContext):
 
     if is_mode_1():
         await state.clear()
-        await botlog(f"MODE1 cleared state user_id={message.from_user.id}")
         return
 
     await typed_delay(float(settings_data.get("reply_delay", 1)))
     await message.reply(get_texts()["consent_text"].format(age=age))
     await state.set_state(Onboarding.waiting_for_consent)
     await botlog(f"CONSENT sent age={age} user_id={message.from_user.id}")
+
+
+def is_mode_1():
+    return int(settings_data.get("mode", 2)) == 1
 
 
 @router.message(Onboarding.waiting_for_consent, F.text)
@@ -890,14 +972,15 @@ async def process_consent(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    await botlog(f"CONSENT step user_id={message.from_user.id} chat_id={message.chat.id}")
+    await botlog(
+        f"CONSENT step user_id={message.from_user.id} chat_id={message.chat.id}"
+    )
 
     if await maybe_ban_on_suspicious_links(message):
         await state.clear()
         return
 
     text = (message.text or "").lower().strip()
-
     positive_words = [
         "да", "давай", "ок", "окей", "хочу", "+", "конечно", "угу", "ага", "yes", "ладно",
         "готов", "готова", "го", "погнали", "ну давай", "давай попробуем", "ладно давай",
