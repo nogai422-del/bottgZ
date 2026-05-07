@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 import re
+import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, time as dtime
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -22,10 +24,40 @@ from aiogram.filters import Command
 # CONFIG
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
-ADMIN_CHAT_ID = 7740055931
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "7740055931"))
 
 ADMINS_FILE = "admins.json"
 SETTINGS_FILE = "settings.json"
+LOG_FILE = "bot.log"
+
+# =========================
+# LOGGING (админ-лог)
+# =========================
+logger = logging.getLogger("botlog")
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(file_handler)
+
+
+async def botlog(text: str):
+    logger.info(text)
+
+
+def read_last_lines(path: str, n: int = 120) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        return "".join(lines[-n:])
+    except FileNotFoundError:
+        return "log file not found"
+
+
+def safe_truncate(s: str, max_len: int = 3900) -> str:
+    return s if len(s) <= max_len else s[-max_len:]
+
 
 # =========================
 # DEFAULTS
@@ -239,62 +271,44 @@ def is_suspicious_text(text: str) -> bool:
     if "t.me/" in t:
         return True
 
-    # vk / telegram / любые упоминания доменов можно расширить так:
-    # if "vk.com" in t or "vk.ru" in t or "vktarget" in t: return True
-
-    # @username (минимум 5 символов)
     return bool(re.search(r"(^|\s)@[\w_]{5,32}($|\s)", t))
 
-async def maybe_ban_on_suspicious_links(message: Message) -> bool:
-    # Собираем возможный текст из разных полей
-    raw_text = (
-        (message.text or "")
-        or (message.caption or "")
-    )
 
-    if not raw_text:
-        return False
-
-    # Лог (в консоль)
-    print("DETECT suspicious:", message.from_user.id, "raw_text=", raw_text[:200])
-
-    if not is_suspicious_text(raw_text):
-        return False
-
-    await do_ban(message, "Подозрительные ссылки/@")
-    return True
-
-# =========================
-# BAN + notify
-# =========================
 async def do_ban(message: Message, reason: str):
     chat_id = message.chat.id
     user_id = message.from_user.id
 
-    # Ссылка на профиль
     profile_link = f'<a href="tg://user?id={user_id}">профиль</a>'
 
-    # 1) БАН и удаление: пробуем удалить текущее сообщение
+    await botlog(f"BAN start chat_id={chat_id} user_id={user_id} reason={reason}")
+
+    # 1) Удаляем текущее сообщение (best effort)
     try:
         await message.delete()
+        await botlog(f"DELETE ok message_id={message.message_id} chat_id={chat_id} user_id={user_id}")
     except Exception as e:
-        # часто бывает "can't delete message" — тогда просто продолжаем
-        print("DELETE failed:", e)
+        await botlog(
+            f"DELETE failed message_id={message.message_id} chat_id={chat_id} user_id={user_id} err={repr(e)}"
+        )
 
     # 2) Бан
     try:
         await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+        await botlog(f"BAN ok chat_id={chat_id} user_id={user_id}")
     except Exception as e:
-        print("BAN failed:", e)
+        await botlog(f"BAN failed chat_id={chat_id} user_id={user_id} err={repr(e)}")
         return
 
-    # 3) После бана ещё раз попробуем удалить (иногда после бана удаление проходит)
+    # 3) Ещё раз удаляем (best effort)
     try:
         await message.delete()
-    except Exception:
-        pass
+        await botlog(f"DELETE(2) ok message_id={message.message_id} chat_id={chat_id} user_id={user_id}")
+    except Exception as e:
+        await botlog(
+            f"DELETE(2) failed message_id={message.message_id} chat_id={chat_id} user_id={user_id} err={repr(e)}"
+        )
 
-    # 4) Оповещаем админов
+    # 4) Оповещаем админов (ошибки игнорируем)
     for admin_id in get_notify_admins():
         try:
             await bot.send_message(
@@ -305,12 +319,35 @@ async def do_ban(message: Message, reason: str):
                 f"Причина: {reason}\n"
                 f"Чат: <code>{chat_id}</code>",
             )
+            await botlog(f"ADMIN notify ok admin_id={admin_id} banned_user_id={user_id} chat_id={chat_id}")
         except TelegramBadRequest as e:
-            if "chat not found" in str(e).lower():
+            msg = str(e).lower()
+            await botlog(
+                f"ADMIN notify bad admin_id={admin_id} banned_user_id={user_id} chat_id={chat_id} err={repr(e)}"
+            )
+            if "chat not found" in msg or "bot can't initiate conversation" in msg:
                 continue
-            raise
-        except Exception:
+        except Exception as e:
+            await botlog(
+                f"ADMIN notify failed admin_id={admin_id} banned_user_id={user_id} chat_id={chat_id} err={repr(e)}"
+            )
             continue
+
+
+async def maybe_ban_on_suspicious_links(message: Message) -> bool:
+    raw_text = (message.text or "") or (message.caption or "")
+    if not raw_text:
+        return False
+
+    if not is_suspicious_text(raw_text):
+        return False
+
+    await botlog(
+        f"DETECT suspicious user_id={message.from_user.id} chat_id={message.chat.id} "
+        f"text={raw_text[:220]!r}"
+    )
+    await do_ban(message, "Подозрительные ссылки/@")
+    return True
 
 
 # =========================
@@ -481,21 +518,15 @@ async def set_mode(message: Message, state: FSMContext):
     await message.answer("Уровень обновлён.", reply_markup=build_admin_panel())
 
 
-# -----------------
-# Minimal admin setters for texts (остальное можешь оставить из твоей версии)
-# -----------------
-
 @router.callback_query(F.data == "admin:edit_welcome")
 async def cb_edit_welcome(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         return
     await state.set_state(AdminEdit.editing_welcome)
-    texts = get_texts()
     await call.message.edit_text(
         "Редактирование приветствия\n\nОтправь новый текст.\nПлейсхолдер: {name}",
         reply_markup=back_to_panel_kb(),
     )
-    # (текущий текст не обязателен)
 
 
 @router.callback_query(F.data == "admin:edit_consent")
@@ -572,6 +603,30 @@ async def save_decline(message: Message, state: FSMContext):
 
 
 # =========================
+# LOGGING COMMANDS
+# =========================
+@router.message(Command("botlog"))
+async def botlog_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    log_text = read_last_lines(LOG_FILE, n=140)
+    await message.answer(
+        "📋 <b>Логи бота</b> (последние события)\n\n"
+        f"<pre>{safe_truncate(log_text)}</pre>"
+    )
+
+
+@router.message(Command("botlog_clear"))
+async def botlog_clear_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    with open(LOG_FILE, "w", encoding="utf-8") as f:
+        f.write("")
+    await message.answer("✅ Логи очищены.")
+    await botlog(f"LOG CLEAR by admin_id={message.from_user.id}")
+
+
+# =========================
 # MAIN SCENARIO
 # =========================
 @router.message(F.new_chat_members)
@@ -588,6 +643,7 @@ async def welcome_new_member(message: Message):
         texts = get_texts()
         user_link = f'<a href="tg://user?id={new_member.id}">{new_member.first_name}</a>'
         welcome_text = texts["welcome_text"].format(name=user_link)
+
         await message.reply(welcome_text)
 
         user_state = FSMContext(
@@ -596,6 +652,10 @@ async def welcome_new_member(message: Message):
         )
         await user_state.set_state(Onboarding.waiting_for_age)
 
+        await botlog(
+            f"WELCOME sent to new_member user_id={new_member.id} chat_id={message.chat.id}"
+        )
+
 
 @router.message(Onboarding.waiting_for_age, F.text)
 async def process_age(message: Message, state: FSMContext):
@@ -603,6 +663,10 @@ async def process_age(message: Message, state: FSMContext):
         await message.reply(bot_is_off_message())
         await state.clear()
         return
+
+    await botlog(
+        f"AGE step user_id={message.from_user.id} chat_id={message.chat.id} text={((message.text or '')[:80])!r}"
+    )
 
     if await maybe_ban_on_suspicious_links(message):
         await state.clear()
@@ -613,27 +677,32 @@ async def process_age(message: Message, state: FSMContext):
     if not match:
         await typed_delay(float(settings_data.get("reply_delay", 1)))
         await message.reply("Не совсем понял цифру. Напиши, пожалуйста, возраст числом 😊")
+        await botlog(f"AGE parse failed user_id={message.from_user.id} chat_id={message.chat.id}")
         return
 
     age = int(match.group())
 
     if age < 18:
+        await botlog(f"AGE rule ban age_lt_18 user_id={message.from_user.id} age={age} chat_id={message.chat.id}")
         await do_ban(message, f"Возраст меньше 18: {age}")
         await state.clear()
         return
 
     if age >= 70:
+        await botlog(f"AGE rule ban age_ge_70 user_id={message.from_user.id} age={age} chat_id={message.chat.id}")
         await do_ban(message, f"Возраст 70+ : {age}")
         await state.clear()
         return
 
     if is_mode_1():
         await state.clear()
+        await botlog(f"MODE1: cleared state user_id={message.from_user.id} chat_id={message.chat.id}")
         return
 
     await typed_delay(float(settings_data.get("reply_delay", 1)))
     await message.reply(get_texts()["consent_text"].format(age=age))
     await state.set_state(Onboarding.waiting_for_consent)
+    await botlog(f"AGE ok -> consent sent user_id={message.from_user.id} age={age} chat_id={message.chat.id}")
 
 
 @router.message(Onboarding.waiting_for_consent, F.text)
@@ -642,6 +711,10 @@ async def process_consent(message: Message, state: FSMContext):
         await message.reply(bot_is_off_message())
         await state.clear()
         return
+
+    await botlog(
+        f"CONSENT step user_id={message.from_user.id} chat_id={message.chat.id} text={((message.text or '')[:80])!r}"
+    )
 
     if await maybe_ban_on_suspicious_links(message):
         await state.clear()
@@ -652,7 +725,7 @@ async def process_consent(message: Message, state: FSMContext):
     positive_words = [
         "да", "давай", "ок", "окей", "хочу", "+", "конечно", "угу", "ага", "yes", "ладно",
         "готов", "готова", "го", "погнали", "ну давай", "давай попробуем", "ладно давай",
-        "попробую", "почему бы и нет, даай", "почему бы и нет, давай", "вай нот", "гоу",
+        "попробую", "почему бы и нет, давай", "почему бы и нет, даай", "вай нот", "гоу",
         "летс",
     ]
     is_agreed = any(word in text.split() for word in positive_words) or text in positive_words
@@ -662,9 +735,11 @@ async def process_consent(message: Message, state: FSMContext):
     if is_agreed:
         await message.reply(get_texts()["questionnaire_text"])
         await state.set_state(Onboarding.waiting_for_questionnaire)
+        await botlog(f"CONSENT ok -> questionnaire sent user_id={message.from_user.id} chat_id={message.chat.id}")
     else:
         await message.reply(get_texts()["decline_text"])
         await state.clear()
+        await botlog(f"CONSENT declined -> state cleared user_id={message.from_user.id} chat_id={message.chat.id}")
 
 
 @router.message(Onboarding.waiting_for_questionnaire, F.text)
@@ -681,13 +756,18 @@ async def process_questionnaire_done(message: Message, state: FSMContext):
         "я заполнила", "отправил", "отправила", "сдал", "сдала", "заполнена анкета",
     ]
     if not any(t in text for t in triggers):
+        await botlog(
+            f"QUESTIONNAIRE no trigger user_id={message.from_user.id} chat_id={message.chat.id}"
+        )
         return
 
-    notify_ids = get_notify_admins()
-    username_display = (
-        f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
+    username_display = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
+
+    await botlog(
+        f"QUESTIONNAIRE accepted user_id={message.from_user.id} chat_id={message.chat.id} text={text[:120]!r}"
     )
 
+    notify_ids = get_notify_admins()
     for admin_id in notify_ids:
         try:
             await bot.send_message(
@@ -697,11 +777,16 @@ async def process_questionnaire_done(message: Message, state: FSMContext):
                 f"Чат: {message.chat.title}\n\n"
                 "Триггер: анкета/готово",
             )
-        except Exception:
+            await botlog(f"ADMIN notify ok admin_id={admin_id} questionnaire_user_id={message.from_user.id}")
+        except Exception as e:
+            await botlog(
+                f"ADMIN notify failed admin_id={admin_id} questionnaire_user_id={message.from_user.id} err={repr(e)}"
+            )
             continue
 
     await state.clear()
     await message.reply("Отлично! Анкета принята.")
+    await botlog(f"STATE cleared after questionnaire user_id={message.from_user.id} chat_id={message.chat.id}")
 
 
 @router.message(Command("sv"))
@@ -711,12 +796,14 @@ async def send_questionnaire_cmd(message: Message):
         return
     await typed_delay(float(settings_data.get("reply_delay", 1)))
     await message.reply(get_texts()["questionnaire_text"])
+    await botlog(f"/sv sent questionnaire user_id={message.from_user.id} chat_id={message.chat.id}")
 
 
 # =========================
 # RUN
 # =========================
 async def main():
+    await botlog("BOT START")
     dp.include_router(router)
     await dp.start_polling(bot)
 
