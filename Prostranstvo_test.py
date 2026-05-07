@@ -239,43 +239,62 @@ def is_suspicious_text(text: str) -> bool:
     if "t.me/" in t:
         return True
 
-    # @username
+    # vk / telegram / любые упоминания доменов можно расширить так:
+    # if "vk.com" in t or "vk.ru" in t or "vktarget" in t: return True
+
+    # @username (минимум 5 символов)
     return bool(re.search(r"(^|\s)@[\w_]{5,32}($|\s)", t))
 
-
 async def maybe_ban_on_suspicious_links(message: Message) -> bool:
-    text = message.text or ""
-    if not is_suspicious_text(text):
+    # Собираем возможный текст из разных полей
+    raw_text = (
+        (message.text or "")
+        or (message.caption or "")
+    )
+
+    if not raw_text:
         return False
+
+    # Лог (в консоль)
+    print("DETECT suspicious:", message.from_user.id, "raw_text=", raw_text[:200])
+
+    if not is_suspicious_text(raw_text):
+        return False
+
     await do_ban(message, "Подозрительные ссылки/@")
     return True
-
 
 # =========================
 # BAN + notify
 # =========================
 async def do_ban(message: Message, reason: str):
-    """
-    Удаляет текущее сообщение нарушителя, банит и уведомляет админов
-    со ссылкой на профиль забаненного.
-    """
     chat_id = message.chat.id
     user_id = message.from_user.id
 
-    # Delete message (текущее)
+    # Ссылка на профиль
+    profile_link = f'<a href="tg://user?id={user_id}">профиль</a>'
+
+    # 1) БАН и удаление: пробуем удалить текущее сообщение
+    try:
+        await message.delete()
+    except Exception as e:
+        # часто бывает "can't delete message" — тогда просто продолжаем
+        print("DELETE failed:", e)
+
+    # 2) Бан
+    try:
+        await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+    except Exception as e:
+        print("BAN failed:", e)
+        return
+
+    # 3) После бана ещё раз попробуем удалить (иногда после бана удаление проходит)
     try:
         await message.delete()
     except Exception:
         pass
 
-    # Ban
-    try:
-        await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
-    except Exception:
-        return
-
-    profile_link = typed_link_user(user_id)
-
+    # 4) Оповещаем админов
     for admin_id in get_notify_admins():
         try:
             await bot.send_message(
