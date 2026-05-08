@@ -568,7 +568,7 @@ async def cb_delay_minus(call: CallbackQuery):
 async def cb_delay_plus(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return
-    if int(settings_data.get("reply_delay", 1)) < 30:
+    if int(settings_data.get("reply_delay", 1)) < 180:
         settings_data["reply_delay"] = int(settings_data.get("reply_delay", 1)) + 1
         persist_all()
     await call.answer()
