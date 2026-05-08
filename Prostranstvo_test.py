@@ -12,12 +12,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    Message,
-)
+from aiogram.types import Message
 from aiogram.filters import Command
 
 # =========================
@@ -31,7 +26,7 @@ SETTINGS_FILE = "settings.json"
 LOG_FILE = "bot.log"
 
 # =========================
-# LOGGING (для админов)
+# LOGGING
 # =========================
 logger = logging.getLogger("botlog")
 logger.setLevel(logging.INFO)
@@ -46,19 +41,6 @@ if not logger.handlers:
 
 async def botlog(text: str):
     logger.info(text)
-
-
-def read_last_lines(path: str, n: int = 120) -> str:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        return "".join(lines[-n:])
-    except FileNotFoundError:
-        return "log file not found"
-
-
-def safe_truncate(s: str, max_len: int = 3900) -> str:
-    return s if len(s) <= max_len else s[-max_len:]
 
 
 # =========================
@@ -81,6 +63,7 @@ _DEFAULT_SETTINGS = {
     "texts": _DEFAULT_TEXTS,
 }
 
+
 # =========================
 # FILE HELPERS
 # =========================
@@ -101,20 +84,10 @@ def load_admins() -> list[int]:
     return [int(x) for x in data]
 
 
-def save_admins(admin_ids: list[int]):
-    with open(ADMINS_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted(set(admin_ids)), f, ensure_ascii=False, indent=2)
-
-
 def load_settings() -> dict:
     _ensure_files()
     with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
-
-
-def save_settings(settings: dict):
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(settings, f, ensure_ascii=False, indent=2)
 
 
 def normalize_settings(data: dict) -> dict:
@@ -141,19 +114,14 @@ def normalize_settings(data: dict) -> dict:
 # =========================
 # INIT
 # =========================
+_ensure_files()
 ADMIN_USER_IDS = load_admins()
 settings_data = normalize_settings(load_settings())
-
-# =========================
-# ADMINS name cache (anti-freeze)
-# =========================
-_admins_cache: dict[int, str] = {}
-_admins_cache_ts: float = 0.0
-ADMINS_CACHE_TTL_SECONDS = 3600  # 1 час
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 router = Router()
+
 
 # =========================
 # STATES
@@ -164,41 +132,12 @@ class Onboarding(StatesGroup):
     waiting_for_questionnaire = State()
 
 
-class AdminEdit(StatesGroup):
-    editing_welcome = State()
-    editing_consent = State()
-    editing_questionnaire = State()
-    editing_decline = State()
-    adding_admin = State()
-    removing_admin = State()
-    setting_notify_admins = State()
-    setting_mode = State()
-    editing_work_start = State()
-    editing_work_end = State()
-
-
 # =========================
 # HELPERS
 # =========================
 async def typed_delay(delay: float):
     if delay and delay > 0:
         await asyncio.sleep(delay)
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_USER_IDS
-
-
-def parse_hhmm(s: str) -> dtime:
-    s = (s or "").strip()
-    m = re.fullmatch(r"(\d{2}):(\d{2})", s)
-    if not m:
-        raise ValueError("Неверный формат времени. Используй HH:MM (например 22:00)")
-    hh = int(m.group(1))
-    mm = int(m.group(2))
-    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
-        raise ValueError("Время вне диапазона")
-    return dtime(hh, mm)
 
 
 def bot_is_off_by_time() -> bool:
@@ -222,12 +161,6 @@ def bot_is_running_for_welcome():
     return int(settings_data.get("mode", 2)) != 0
 
 
-def bot_is_running_for_questionnaire():
-    if bot_is_off_by_time():
-        return False
-    return int(settings_data.get("mode", 2)) == 2
-
-
 def get_texts():
     return settings_data.get("texts", {})
 
@@ -245,12 +178,20 @@ def bot_is_off_message() -> str:
     )
 
 
-def persist_all():
-    save_settings(settings_data)
+def parse_hhmm(s: str) -> dtime:
+    s = (s or "").strip()
+    m = re.fullmatch(r"(\d{2}):(\d{2})", s)
+    if not m:
+        raise ValueError("Неверный формат времени. Используй HH:MM (например 22:00)")
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        raise ValueError("Время вне диапазона")
+    return dtime(hh, mm)
 
 
 # =========================
-# Suspicious detection + BAN
+# DETECT + BAN
 # =========================
 def is_suspicious_text(text: str) -> bool:
     if not text:
@@ -265,43 +206,123 @@ def is_suspicious_text(text: str) -> bool:
     return bool(re.search(r"(^|\s)@[\w_]{5,32}($|\s)", t))
 
 
+def is_refusal(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip().lower()
+
+    refusal_phrases = [
+        "не хочу", "не хочy", "не хочу называть", "не буду", "не назову",
+        "я не хочу", "я не буду", "отказываюсь",
+        "нет", "не согласен", "не согласна", "не надо", "убери",
+        "не хочу заполнять", "не буду заполнять", "не хочу анкету",
+        "не хочу называть возраст", "не скажу возраст", "не скажу",
+        "я против", "против", "отказ", "не хочу отвечать", "не буду отвечать",
+    ]
+    for p in refusal_phrases:
+        if p in t:
+            return True
+
+    short_refusals = {"нет", "не хочу", "не буду", "против", "отказ"}
+    return t in short_refusals
+
+
+def words_to_int_ru(text: str) -> int | None:
+    if not text:
+        return None
+
+    t = text.strip().lower()
+    t = re.sub(r"[^\w\s-]", " ", t, flags=re.UNICODE)
+    t = re.sub(r"\s+", " ", t).strip()
+
+    m = re.search(r"\d{1,3}", t)
+    if m:
+        return int(m.group(0))
+
+    units = {
+        "ноль": 0, "один": 1, "одна": 1, "одно": 1,
+        "два": 2, "две": 2,
+        "три": 3, "четыре": 4, "пять": 5, "шесть": 6,
+        "семь": 7, "восемь": 8, "девять": 9,
+    }
+    teens = {
+        "десять": 10, "одиннадцать": 11, "двенадцать": 12,
+        "тринадцать": 13, "четырнадцать": 14, "пятнадцать": 15,
+        "шестнадцать": 16, "семнадцать": 17,
+    }
+    tens = {
+        "двадцать": 20, "тридцать": 30, "сорок": 40,
+        "пятьдесят": 50, "шестьдесят": 60, "семьдесят": 70,
+    }
+
+    tokens = t.split()
+    if len(tokens) == 1:
+        tok = tokens[0]
+        if tok in units:
+            return units[tok]
+        if tok in teens:
+            return teens[tok]
+        if tok in tens:
+            return tens[tok]
+        return None
+
+    joined = " ".join(tokens)
+    if joined in teens:
+        return teens[joined]
+
+    tens_val = None
+    for tok in tokens:
+        if tok in tens:
+            tens_val = tens[tok]
+            break
+
+    if tens_val is not None:
+        total = tens_val
+        for tok in tokens:
+            if tok in units:
+                total += units[tok]
+                return total
+        return total
+
+    return None
+
+
+async def safe_delete(chat_id: int, message_id: int, tag: str = ""):
+    if not message_id:
+        return False
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        await botlog(f"DELETE ok {tag} chat_id={chat_id} message_id={message_id}")
+        return True
+    except Exception as e:
+        await botlog(
+            f"DELETE FAIL {tag} chat_id={chat_id} message_id={message_id} err={repr(e)}"
+        )
+        return False
+
+
+def message_link(chat_id: int, message_id: int) -> str:
+    return f"chat_id={chat_id} message_id={message_id}"
+
+
 async def do_ban(message: Message, reason: str):
     chat_id = message.chat.id
     user_id = message.from_user.id
 
     await botlog(f"BAN start chat_id={chat_id} user_id={user_id} reason={reason}")
 
-    # delete best-effort
+    # delete the current message (best-effort)
     try:
         await message.delete()
-        await botlog(
-            f"DELETE ok message_id={message.message_id} chat_id={chat_id} user_id={user_id}"
-        )
-    except Exception as e:
-        await botlog(
-            f"DELETE failed message_id={message.message_id} chat_id={chat_id} user_id={user_id} err={repr(e)}"
-        )
+    except Exception:
+        pass
 
-    # ban
     try:
         await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
-        await botlog(f"BAN ok chat_id={chat_id} user_id={user_id}")
     except Exception as e:
         await botlog(f"BAN failed chat_id={chat_id} user_id={user_id} err={repr(e)}")
         return
 
-    # delete again
-    try:
-        await message.delete()
-        await botlog(
-            f"DELETE(2) ok message_id={message.message_id} chat_id={chat_id} user_id={user_id}"
-        )
-    except Exception as e:
-        await botlog(
-            f"DELETE(2) failed message_id={message.message_id} chat_id={chat_id} user_id={user_id} err={repr(e)}"
-        )
-
-    # notify admins list
     profile_link = f'<a href="tg://user?id={user_id}">профиль</a>'
     for admin_id in get_notify_admins():
         try:
@@ -333,602 +354,43 @@ async def maybe_ban_on_suspicious_links(message: Message) -> bool:
     return True
 
 
-# =========================
-# ADMIN PANEL (красиво + список админов + тексты)
-# =========================
-def back_to_panel_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="admin:panel")]]
-    )
+async def ban_with_cleanup(message: Message, reason: str, state: FSMContext):
+    chat_id = message.chat.id
+    data = await state.get_data()
 
+    user_ids = data.get("user_message_ids", []) or []
+    bot_ids = data.get("bot_message_ids", []) or []
 
-def _mode_label() -> str:
-    m = int(settings_data.get("mode", 2))
-    return "Уровень 0" if m == 0 else "Уровень 1" if m == 1 else "Уровень 2"
+    if message.message_id not in user_ids:
+        user_ids.append(message.message_id)
 
+    delete_ids = list(set(user_ids + bot_ids))
 
-def _status_label() -> str:
-    active = settings_data.get("is_active", True)
-    off_by_time = bot_is_off_by_time()
-    if active and not off_by_time:
-        return "🟢 Включен"
-    return "🔴 Выключен/время off"
+    joined_mid = data.get("joined_message_id")
+    welcome_mid = data.get("welcome_message_id")
 
+    if joined_mid:
+        delete_ids.append(joined_mid)
+    if welcome_mid:
+        delete_ids.append(welcome_mid)
 
-async def format_admins_list(limit: int = 50) -> str:
-    """
-    Anti-freeze:
-    - кэш имён
-    - максимум 8 get_chat на один callback
-    - wait_for таймаут
-    """
-    global _admins_cache, _admins_cache_ts
+    # system-ish first
+    if joined_mid:
+        await safe_delete(chat_id, joined_mid, tag="joined")
+    if welcome_mid:
+        await safe_delete(chat_id, welcome_mid, tag="welcome")
 
-    now_ts = datetime.now().timestamp()
-    if not _admins_cache or (now_ts - _admins_cache_ts) > ADMINS_CACHE_TTL_SECONDS:
-        _admins_cache = {}
-        _admins_cache_ts = now_ts
+    for mid in set(delete_ids):
+        if mid in (joined_mid, welcome_mid):
+            continue
+        await safe_delete(chat_id, mid, tag="collected")
 
-    if not ADMIN_USER_IDS:
-        return "Список админов пуст."
-
-    hard_limit = min(limit, 8)
-    lines: list[str] = []
-
-    for i, uid in enumerate(ADMIN_USER_IDS[:hard_limit], start=1):
-        name = _admins_cache.get(uid)
-        if not name:
-            try:
-                chat = await asyncio.wait_for(bot.get_chat(uid), timeout=4.0)
-                title = getattr(chat, "full_name", None) or getattr(chat, "first_name", None)
-                if title:
-                    name = title
-                else:
-                    uname = getattr(chat, "username", None)
-                    name = f"@{uname}" if uname else "—"
-            except Exception:
-                name = "—"
-            _admins_cache[uid] = name
-
-        lines.append(f"{i}. <code>{uid}</code> — {name}")
-
-    total = len(ADMIN_USER_IDS)
-    if total > hard_limit:
-        lines.append(f"… и ещё {total - hard_limit} админ(ов) (показываю первые {hard_limit}).")
-
-    return "\n".join(lines)
-
-
-def build_admin_panel() -> InlineKeyboardMarkup:
-    delay = settings_data.get("reply_delay", 1)
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"Статус: {_status_label()}", callback_data="admin:noop")],
-            [
-                InlineKeyboardButton(
-                    text=f"Интервал: {settings_data['work_start']}–{settings_data['work_end']}",
-                    callback_data="admin:work_info",
-                )
-            ],
-            [InlineKeyboardButton(text=f"{_mode_label()}", callback_data="admin:mode_info")],
-            [
-                InlineKeyboardButton(text="−1c", callback_data="admin:delay_minus"),
-                InlineKeyboardButton(text=f"Задержка: {delay}с", callback_data="admin:delay_info"),
-                InlineKeyboardButton(text="+1c", callback_data="admin:delay_plus"),
-            ],
-            [InlineKeyboardButton(text="📝 Тексты", callback_data="admin:view_texts")],
-            [InlineKeyboardButton(text="👮 Админы", callback_data="admin:view_admins")],
-            [
-                InlineKeyboardButton(text="✏️ Приветствие", callback_data="admin:edit_welcome"),
-                InlineKeyboardButton(text="✏️ Согласие", callback_data="admin:edit_consent"),
-            ],
-            [
-                InlineKeyboardButton(text="✏️ Анкета", callback_data="admin:edit_questionnaire"),
-                InlineKeyboardButton(text="✏️ Отказ", callback_data="admin:edit_decline"),
-            ],
-            [
-                InlineKeyboardButton(text="⏱ Старт", callback_data="admin:edit_work_start"),
-                InlineKeyboardButton(text="⏱ Конец", callback_data="admin:edit_work_end"),
-            ],
-            [
-                InlineKeyboardButton(text="➕ Админ", callback_data="admin:add_admin"),
-                InlineKeyboardButton(text="➖ Убрать", callback_data="admin:remove_admin"),
-            ],
-            [
-                InlineKeyboardButton(text="🔔 Оповещения", callback_data="admin:edit_notify_admins"),
-                InlineKeyboardButton(text="⚙️ Уровень", callback_data="admin:edit_mode"),
-            ],
-            [InlineKeyboardButton(text="🟣 Toggle is_active", callback_data="admin:toggle_active")],
-            [InlineKeyboardButton(text="🧾 Логи (/botlog)", callback_data="admin:noop")],
-        ]
-    )
-
-
-@router.message(Command("panel"))
-async def admin_panel(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
+    await do_ban(message, reason)
     await state.clear()
-    await message.answer(
-        "⚙️ <b>Панель управления ботом</b>\n\n"
-        f"• {_status_label()}\n"
-        f"• Уровень: <code>{settings_data.get('mode', 2)}</code>\n"
-        f"• Интервал: <code>{settings_data['work_start']}–{settings_data['work_end']}</code>\n"
-        f"• Задержка: <code>{settings_data.get('reply_delay', 1)}</code> сек\n\n"
-        "Выбирай действие ниже:",
-        reply_markup=build_admin_panel(),
-    )
-
-
-@router.callback_query(F.data == "admin:panel")
-async def cb_back_to_panel(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    await state.clear()
-    try:
-        await call.message.edit_text(
-            "⚙️ <b>Панель управления ботом</b>\n\n"
-            f"• {_status_label()}\n"
-            f"• Уровень: <code>{settings_data.get('mode', 2)}</code>\n"
-            f"• Интервал: <code>{settings_data['work_start']}–{settings_data['work_end']}</code>\n"
-            f"• Задержка: <code>{settings_data.get('reply_delay', 1)}</code> сек\n\n"
-            "Выбирай действие ниже:",
-            reply_markup=build_admin_panel(),
-        )
-    except Exception:
-        pass
-    await call.answer()
-
-
-@router.callback_query(F.data == "admin:noop")
-async def cb_noop(call: CallbackQuery):
-    await call.answer()
-
-
-@router.callback_query(F.data == "admin:view_admins")
-async def cb_view_admins(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-
-    # ✅ важно: отвечаем сразу, чтобы callback не "завис"
-    await call.answer()
-
-    admins_text = await format_admins_list()
-
-    await state.clear()
-    try:
-        await call.message.edit_text(
-            "👮 <b>Админы бота</b>\n\n"
-            "Формат: номер. <code>ID</code> — имя/ник\n\n"
-            f"<pre>{admins_text}</pre>",
-            reply_markup=back_to_panel_kb(),
-        )
-    except Exception:
-        pass
-
-
-@router.callback_query(F.data == "admin:view_texts")
-async def cb_view_texts(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-
-    await call.answer()
-
-    texts = get_texts()
-
-    def fmt_block(key: str, value: str) -> str:
-        v = (value or "").strip()
-        if len(v) > 1200:
-            v = v[:1200] + "…"
-        return f"• <code>{key}</code>\n{v}\n"
-
-    body = (
-        "📝 <b>Тексты и заготовки</b>\n\n"
-        + fmt_block("welcome_text", texts.get("welcome_text", ""))
-        + fmt_block("consent_text", texts.get("consent_text", ""))
-        + fmt_block("questionnaire_text", texts.get("questionnaire_text", ""))
-        + fmt_block("decline_text", texts.get("decline_text", ""))
-    )
-
-    await state.clear()
-    try:
-        await call.message.edit_text(body, reply_markup=back_to_panel_kb())
-    except Exception:
-        pass
-
-
-@router.callback_query(F.data == "admin:toggle_active")
-async def cb_toggle_active(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        return
-    settings_data["is_active"] = not settings_data.get("is_active", True)
-    persist_all()
-    await call.answer()
-    try:
-        await call.message.edit_reply_markup(reply_markup=build_admin_panel())
-    except TelegramBadRequest:
-        pass
-
-
-@router.callback_query(F.data == "admin:delay_minus")
-async def cb_delay_minus(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        return
-    settings_data["reply_delay"] = max(0, int(settings_data.get("reply_delay", 1)) - 1)
-    persist_all()
-    await call.answer()
-    try:
-        await call.message.edit_reply_markup(reply_markup=build_admin_panel())
-    except TelegramBadRequest:
-        pass
-
-
-@router.callback_query(F.data == "admin:delay_plus")
-async def cb_delay_plus(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
-        return
-    if int(settings_data.get("reply_delay", 1)) < 180:
-        settings_data["reply_delay"] = int(settings_data.get("reply_delay", 1)) + 1
-        persist_all()
-    await call.answer()
-    try:
-        await call.message.edit_reply_markup(reply_markup=build_admin_panel())
-    except TelegramBadRequest:
-        pass
-
-
-@router.callback_query(F.data == "admin:delay_info")
-async def cb_delay_info(call: CallbackQuery):
-    await call.answer(f"Текущая задержка: {settings_data.get('reply_delay', 1)} сек", show_alert=True)
-
-
-@router.callback_query(F.data == "admin:work_info")
-async def cb_work_info(call: CallbackQuery):
-    await call.answer(
-        f"Интервал работы: {settings_data['work_start']} - {settings_data['work_end']}\nПоддерживается через полночь.",
-        show_alert=True,
-    )
-
-
-@router.callback_query(F.data == "admin:mode_info")
-async def cb_mode_info(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    await state.set_state(AdminEdit.setting_mode)
-    await call.answer()
-    await call.message.edit_text(
-        "🎚️ <b>Уровень работы бота</b>\n\n"
-        "0 — бот выключен\n"
-        "1 — спрашивает только возраст\n"
-        "2 — выполняет все шаги\n\n"
-        f"Текущий: <code>{settings_data.get('mode', 2)}</code>\n\n"
-        "Отправь: 0 / 1 / 2",
-        reply_markup=back_to_panel_kb(),
-    )
-
-
-@router.message(AdminEdit.setting_mode)
-async def set_mode(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    t = (message.text or "").strip()
-    if t not in {"0", "1", "2"}:
-        await message.answer("Отправь только 0, 1 или 2.")
-        return
-    settings_data["mode"] = int(t)
-    persist_all()
-    await state.clear()
-    await message.answer("✅ Уровень обновлён.", reply_markup=build_admin_panel())
-
-
-# ===== Edit texts =====
-@router.callback_query(F.data == "admin:edit_welcome")
-async def cb_edit_welcome(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    await state.set_state(AdminEdit.editing_welcome)
-    await call.answer()
-    await call.message.edit_text(
-        "✏️ <b>Редактирование приветствия</b>\n\n"
-        "Отправь новый текст.\n"
-        "Плейсхолдеры: {name}",
-        reply_markup=back_to_panel_kb(),
-    )
-
-
-@router.callback_query(F.data == "admin:edit_consent")
-async def cb_edit_consent(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    await state.set_state(AdminEdit.editing_consent)
-    await call.answer()
-    await call.message.edit_text(
-        "✏️ <b>Редактирование согласия</b>\n\n"
-        "Отправь новый текст.\n"
-        "Плейсхолдеры: {age}",
-        reply_markup=back_to_panel_kb(),
-    )
-
-
-@router.callback_query(F.data == "admin:edit_questionnaire")
-async def cb_edit_questionnaire(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    await state.set_state(AdminEdit.editing_questionnaire)
-    await call.answer()
-    await call.message.edit_text(
-        "✏️ <b>Редактирование текста анкеты</b>\n\n"
-        "Отправь новый текст.",
-        reply_markup=back_to_panel_kb(),
-    )
-
-
-@router.callback_query(F.data == "admin:edit_decline")
-async def cb_edit_decline(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    await state.set_state(AdminEdit.editing_decline)
-    await call.answer()
-    await call.message.edit_text(
-        "✏️ <b>Редактирование текста отказа</b>\n\n"
-        "Отправь новый текст.",
-        reply_markup=back_to_panel_kb(),
-    )
-
-
-@router.message(AdminEdit.editing_welcome)
-async def save_welcome(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    settings_data["texts"]["welcome_text"] = message.text or ""
-    persist_all()
-    await state.clear()
-    await message.answer("✅ Приветствие обновлено.", reply_markup=build_admin_panel())
-
-
-@router.message(AdminEdit.editing_consent)
-async def save_consent(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    settings_data["texts"]["consent_text"] = message.text or ""
-    persist_all()
-    await state.clear()
-    await message.answer("✅ Согласие обновлено.", reply_markup=build_admin_panel())
-
-
-@router.message(AdminEdit.editing_questionnaire)
-async def save_questionnaire(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    settings_data["texts"]["questionnaire_text"] = message.text or ""
-    persist_all()
-    await state.clear()
-    await message.answer("✅ Анкета обновлена.", reply_markup=build_admin_panel())
-
-
-@router.message(AdminEdit.editing_decline)
-async def save_decline(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    settings_data["texts"]["decline_text"] = message.text or ""
-    persist_all()
-    await state.clear()
-    await message.answer("✅ Отказ обновлён.", reply_markup=build_admin_panel())
-
-
-# ===== Work times =====
-@router.callback_query(F.data == "admin:edit_work_start")
-async def cb_edit_work_start(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    await state.set_state(AdminEdit.editing_work_start)
-    await call.answer()
-    await call.message.edit_text(
-        "⏱ <b>Редактирование времени СТАРТА</b>\n\n"
-        "Отправь HH:MM (например 22:00).",
-        reply_markup=back_to_panel_kb(),
-    )
-
-
-@router.callback_query(F.data == "admin:edit_work_end")
-async def cb_edit_work_end(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    await state.set_state(AdminEdit.editing_work_end)
-    await call.answer()
-    await call.message.edit_text(
-        "⏱ <b>Редактирование времени КОНЦА</b>\n\n"
-        "Отправь HH:MM (например 06:00).",
-        reply_markup=back_to_panel_kb(),
-    )
-
-
-@router.message(AdminEdit.editing_work_start)
-async def set_work_start(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        parse_hhmm(message.text or "")
-    except Exception as e:
-        await message.answer(f"Ошибка: {e}")
-        return
-    settings_data["work_start"] = (message.text or "").strip()
-    persist_all()
-    await state.clear()
-    await message.answer("✅ Старт обновлён.", reply_markup=build_admin_panel())
-
-
-@router.message(AdminEdit.editing_work_end)
-async def set_work_end(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        parse_hhmm(message.text or "")
-    except Exception as e:
-        await message.answer(f"Ошибка: {e}")
-        return
-    settings_data["work_end"] = (message.text or "").strip()
-    persist_all()
-    await state.clear()
-    await message.answer("✅ Конец обновлён.", reply_markup=build_admin_panel())
-
-
-# ===== Admin management (ID/username) =====
-async def resolve_user_id(query: str) -> int:
-    q = (query or "").strip()
-    if re.fullmatch(r"\d+", q):
-        return int(q)
-    if q.startswith("@"):
-        q = q[1:]
-    chat = await bot.get_chat(q)
-    return int(chat.id)
-
-
-@router.callback_query(F.data == "admin:add_admin")
-async def cb_add_admin(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    await state.set_state(AdminEdit.adding_admin)
-    await call.answer()
-    await call.message.edit_text(
-        "➕ <b>Добавить админа</b>\n\n"
-        "Отправь ID или username (например: 12345 или @username).",
-        reply_markup=back_to_panel_kb(),
-    )
-
-
-@router.callback_query(F.data == "admin:remove_admin")
-async def cb_remove_admin(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    await state.set_state(AdminEdit.removing_admin)
-    await call.answer()
-    await call.message.edit_text(
-        "➖ <b>Убрать админа</b>\n\n"
-        "Отправь ID или username (например: 12345 или @username).",
-        reply_markup=back_to_panel_kb(),
-    )
-
-
-@router.message(AdminEdit.adding_admin)
-async def adding_admin_handler(message: Message, state: FSMContext):
-    global _admins_cache_ts, _admins_cache
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        uid = await resolve_user_id(message.text or "")
-    except Exception as e:
-        await message.answer(f"❌ Не могу определить пользователя: {e}")
-        return
-
-    if uid in ADMIN_USER_IDS:
-        await message.answer("Этот пользователь уже админ.")
-        await state.clear()
-        return
-
-    ADMIN_USER_IDS.append(uid)
-    save_admins(ADMIN_USER_IDS)
-
-    # сброс кэша имён
-    _admins_cache = {}
-    _admins_cache_ts = 0.0
-
-    await state.clear()
-    await message.answer("✅ Админ добавлен.", reply_markup=build_admin_panel())
-
-
-@router.message(AdminEdit.removing_admin)
-async def removing_admin_handler(message: Message, state: FSMContext):
-    global _admins_cache_ts, _admins_cache
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        uid = await resolve_user_id(message.text or "")
-    except Exception as e:
-        await message.answer(f"❌ Не могу определить пользователя: {e}")
-        return
-
-    if uid not in ADMIN_USER_IDS:
-        await message.answer("Этот пользователь не админ.")
-        await state.clear()
-        return
-
-    ADMIN_USER_IDS[:] = [x for x in ADMIN_USER_IDS if x != uid]
-    save_admins(ADMIN_USER_IDS)
-
-    # сброс кэша имён
-    _admins_cache = {}
-    _admins_cache_ts = 0.0
-
-    await state.clear()
-    await message.answer("✅ Админ удалён.", reply_markup=build_admin_panel())
-
-
-# ===== notify admins list =====
-@router.callback_query(F.data == "admin:edit_notify_admins")
-async def cb_edit_notify_admins(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        return
-    await state.set_state(AdminEdit.setting_notify_admins)
-    await call.answer()
-    await call.message.edit_text(
-        "🔔 <b>Админы оповещений</b>\n\n"
-        "Пришли ID или username.\n"
-        "Повтор — уберёт из списка.",
-        reply_markup=back_to_panel_kb(),
-    )
-
-
-@router.message(AdminEdit.setting_notify_admins)
-async def setting_notify_admins_handler(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        uid = await resolve_user_id(message.text or "")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
-        return
-
-    cur = set(get_notify_admins())
-    if uid in cur:
-        cur.remove(uid)
-    else:
-        cur.add(uid)
-
-    if not cur:
-        await message.answer("❌ Список не может быть пустым.")
-        return
-
-    settings_data["notify_admins"] = list(cur)
-    persist_all()
-    await state.clear()
-    await message.answer("✅ Список обновлён.", reply_markup=build_admin_panel())
-
-
-# ===== Botlog commands =====
-@router.message(Command("botlog"))
-async def botlog_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    log_text = read_last_lines(LOG_FILE, n=160)
-    await message.answer(
-        "📋 <b>Логи бота</b>\n\n" f"<pre>{safe_truncate(log_text)}</pre>"
-    )
-
-
-@router.message(Command("botlog_clear"))
-async def botlog_clear_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    with open(LOG_FILE, "w", encoding="utf-8") as f:
-        f.write("")
-    await botlog(f"LOG CLEAR by admin_id={message.from_user.id}")
-    await message.answer("✅ Логи очищены.")
 
 
 # =========================
-# USER SCENARIO
+# SYSTEM MESSAGES: вход / исключение
 # =========================
 @router.message(F.new_chat_members)
 async def welcome_new_member(message: Message):
@@ -944,16 +406,57 @@ async def welcome_new_member(message: Message):
         texts = get_texts()
         user_link = f'<a href="tg://user?id={new_member.id}">{new_member.first_name}</a>'
         welcome_text = texts["welcome_text"].format(name=user_link)
-        await message.reply(welcome_text)
 
         user_state = FSMContext(
             storage=dp.storage,
-            key=StorageKey(bot_id=bot.id, chat_id=message.chat.id, user_id=new_member.id),
+            key=StorageKey(
+                bot_id=bot.id,
+                chat_id=message.chat.id,
+                user_id=new_member.id,
+            ),
         )
+
         await user_state.set_state(Onboarding.waiting_for_age)
+
+        welcome_msg = await message.reply(welcome_text)
+
+        await user_state.update_data(
+            joined_message_id=message.message_id,      # системное сообщение о входе (best-effort)
+            welcome_message_id=welcome_msg.message_id,  # ответ бота
+            user_message_ids=[],
+            bot_message_ids=[welcome_msg.message_id],
+        )
+
         await botlog(f"WELCOME sent user_id={new_member.id} chat_id={message.chat.id}")
 
 
+# ✅ ВАЖНО: удаляем системное сообщение об исключении (left_chat_member)
+@router.message(F.left_chat_member)
+async def left_chat_member_handler(message: Message):
+    # message.message_id у системного апдейта может не удаляться всегда,
+    # но мы делаем best-effort и логируем.
+    chat_id = message.chat.id
+
+    # В aiogram v3: message.left_chat_member может быть User или list[User]
+    left_obj = getattr(message, "left_chat_member", None)
+    user_ids = []
+
+    if left_obj is None:
+        user_ids = []
+    elif isinstance(left_obj, list):
+        user_ids = [u.id for u in left_obj if u and getattr(u, "id", None)]
+    else:
+        # одиночный объект
+        uid = getattr(left_obj, "id", None)
+        user_ids = [uid] if uid else []
+
+    tag = f"left({','.join(map(str, user_ids))})" if user_ids else "left"
+    await safe_delete(chat_id, message.message_id, tag=tag)
+
+
+# =========================
+# USER SCENARIO
+# =========================
 @router.message(Onboarding.waiting_for_age, F.text)
 async def process_age(message: Message, state: FSMContext):
     if not bot_is_running_for_welcome():
@@ -961,30 +464,58 @@ async def process_age(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    await botlog(f"AGE step user_id={message.from_user.id} chat_id={message.chat.id}")
-
     if await maybe_ban_on_suspicious_links(message):
         await state.clear()
         return
 
-    text = message.text or ""
-    match = re.search(r"\d+", text.lower())
-    if not match:
-        await typed_delay(float(settings_data.get("reply_delay", 1)))
-        await message.reply("Не совсем понял цифру. Напиши, пожалуйста, возраст числом 😊")
-        await botlog(f"AGE parse failed user_id={message.from_user.id}")
+    data = await state.get_data()
+    user_message_ids = data.get("user_message_ids", []) or []
+    if message.message_id not in user_message_ids:
+        user_message_ids.append(message.message_id)
+        await state.update_data(user_message_ids=user_message_ids)
+
+    if is_refusal(message.text or ""):
+        await ban_with_cleanup(message, "Отказ назвать возраст", state)
         return
 
-    age = int(match.group())
+    text = (message.text or "").strip()
+
+    age = None
+    m = re.search(r"\d{1,3}", text)
+    if m:
+        age = int(m.group(0))
+    else:
+        age = words_to_int_ru(text)
+
+    if age is None:
+        # НЕ баним: просто уведомляем админов
+        await botlog(f"AGE parse failed user_id={message.from_user.id} chat_id={message.chat.id}")
+
+        profile_link = f'<a href="tg://user?id={message.from_user.id}">профиль</a>'
+        link_info = message_link(message.chat.id, message.message_id)
+        snippet = (message.text or "")[:400]
+
+        for admin_id in get_notify_admins():
+            try:
+                await bot.send_message(
+                    admin_id,
+                    "⚠️ Не понял возраст (не распознал)\n\n"
+                    f"Пользователь: {profile_link}\n"
+                    f"ID: <code>{message.from_user.id}</code>\n"
+                    f"Чат: <code>{message.chat.id}</code>\n"
+                    f"Сообщение: <code>{link_info}</code>\n\n"
+                    f"Текст: <code>{snippet}</code>",
+                )
+            except Exception:
+                continue
+        return
 
     if age < 18:
-        await do_ban(message, f"Возраст меньше 18: {age}")
-        await state.clear()
+        await ban_with_cleanup(message, f"Возраст меньше 18: {age}", state)
         return
 
     if age >= 70:
-        await do_ban(message, f"Возраст 70+ : {age}")
-        await state.clear()
+        await ban_with_cleanup(message, f"Возраст 70+ : {age}", state)
         return
 
     if int(settings_data.get("mode", 2)) == 1:
@@ -992,9 +523,16 @@ async def process_age(message: Message, state: FSMContext):
         return
 
     await typed_delay(float(settings_data.get("reply_delay", 1)))
-    await message.reply(get_texts()["consent_text"].format(age=age))
+
+    consent_msg = await message.reply(get_texts()["consent_text"].format(age=age))
+
+    data = await state.get_data()
+    bot_message_ids = data.get("bot_message_ids", []) or []
+    if consent_msg.message_id not in bot_message_ids:
+        bot_message_ids.append(consent_msg.message_id)
+        await state.update_data(bot_message_ids=bot_message_ids)
+
     await state.set_state(Onboarding.waiting_for_consent)
-    await botlog(f"CONSENT sent age={age} user_id={message.from_user.id}")
 
 
 @router.message(Onboarding.waiting_for_consent, F.text)
@@ -1004,31 +542,45 @@ async def process_consent(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    await botlog(f"CONSENT step user_id={message.from_user.id} chat_id={message.chat.id}")
-
     if await maybe_ban_on_suspicious_links(message):
         await state.clear()
         return
 
+    data = await state.get_data()
+    user_message_ids = data.get("user_message_ids", []) or []
+    if message.message_id not in user_message_ids:
+        user_message_ids.append(message.message_id)
+        await state.update_data(user_message_ids=user_message_ids)
+
     text = (message.text or "").lower().strip()
     positive_words = [
-        "да", "давай", "ок", "окей", "хочу", "+", "конечно", "угу", "ага", "yes", "ладно",
-        "готов", "готова", "го", "погнали", "ну давай", "давай попробуем", "ладно давай",
-        "попробую", "почему бы и нет, давай", "почему бы и нет, даай", "вай нот", "гоу",
-        "летс",
+        "да", "давай", "ок", "окей", "хочу", "+", "конечно", "угу", "ага", "yes",
+        "ладно", "готов", "готова", "го", "погнали", "ну давай", "давай попробуем",
+        "ладно давай", "попробую", "вай нот", "гоу", "летс",
     ]
-    is_agreed = any(w in text.split() for w in positive_words) or text in positive_words
+    words = set(text.split())
+    is_agreed = any(w in words for w in positive_words) or text in positive_words
 
     await typed_delay(float(settings_data.get("reply_delay", 1)))
 
     if is_agreed:
-        await message.reply(get_texts()["questionnaire_text"])
+        questionnaire_msg = await message.reply(get_texts()["questionnaire_text"])
+        data = await state.get_data()
+        bot_message_ids = data.get("bot_message_ids", []) or []
+        if questionnaire_msg.message_id not in bot_message_ids:
+            bot_message_ids.append(questionnaire_msg.message_id)
+            await state.update_data(bot_message_ids=bot_message_ids)
+
         await state.set_state(Onboarding.waiting_for_questionnaire)
-        await botlog(f"QUESTIONNAIRE sent user_id={message.from_user.id}")
     else:
-        await message.reply(get_texts()["decline_text"])
+        decline_msg = await message.reply(get_texts()["decline_text"])
+        data = await state.get_data()
+        bot_message_ids = data.get("bot_message_ids", []) or []
+        if decline_msg.message_id not in bot_message_ids:
+            bot_message_ids.append(decline_msg.message_id)
+            await state.update_data(bot_message_ids=bot_message_ids)
+
         await state.clear()
-        await botlog(f"DECLINE -> state cleared user_id={message.from_user.id}")
 
 
 @router.message(Onboarding.waiting_for_questionnaire, F.text)
@@ -1037,16 +589,21 @@ async def process_questionnaire_done(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    text = (message.text or "").strip().lower()
-    triggers = [
-        "заполнил", "заполнила", "заполнено", "готов", "готова", "готово",
-        "анкета готова", "анкета заполнена", "анкета готовa", "я заполнил",
-        "я заполнила", "отправил", "отправила", "сдал", "сдала", "заполнена анкета",
-    ]
-    if not any(t in text for t in triggers):
+    data = await state.get_data()
+    user_message_ids = data.get("user_message_ids", []) or []
+    if message.message_id not in user_message_ids:
+        user_message_ids.append(message.message_id)
+        await state.update_data(user_message_ids=user_message_ids)
+
+    if is_refusal(message.text or ""):
+        await ban_with_cleanup(message, "Отказ заполнять анкету", state)
         return
 
-    username_display = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
+    username_display = (
+        f"@{message.from_user.username}"
+        if message.from_user.username
+        else message.from_user.first_name
+    )
 
     await botlog(f"QUESTIONNAIRE accepted user_id={message.from_user.id}")
 
@@ -1057,19 +614,25 @@ async def process_questionnaire_done(message: Message, state: FSMContext):
                 "Анкета заполнена\n\n"
                 f"Кто: {username_display} (ID: <code>{message.from_user.id}</code>)\n"
                 f"Чат: {message.chat.title}\n\n"
-                "Триггер: анкета/готово",
+                "Действие: пользователь отправил текст анкеты",
             )
         except Exception:
             continue
 
+    ok_msg = await message.reply("Отлично! Анкета принята.")
+
+    data = await state.get_data()
+    bot_message_ids = data.get("bot_message_ids", []) or []
+    if ok_msg.message_id not in bot_message_ids:
+        bot_message_ids.append(ok_msg.message_id)
+        await state.update_data(bot_message_ids=bot_message_ids)
+
     await state.clear()
-    await message.reply("Отлично! Анкета принята.")
-    await botlog(f"STATE cleared after questionnaire user_id={message.from_user.id}")
 
 
 @router.message(Command("sv"))
 async def send_questionnaire_cmd(message: Message):
-    if not bot_is_running_for_questionnaire():
+    if not bot_is_running_for_welcome():
         await message.reply(bot_is_off_message())
         return
     await typed_delay(float(settings_data.get("reply_delay", 1)))
