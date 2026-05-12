@@ -40,20 +40,11 @@ async def botlog(text: str):
 
 
 # =========================
-# ANTI-DUPL для /bv (ВАЖНО)
-# Если Telegram шлёт дубль одинакового апдейта — aiogram может обработать оба раза.
-# Этот фикс гарантирует обработку только одного /bv на update_id.
-# =========================
-_last_bv_update_id: int | None = None
-
-# =========================
 # DEFAULTS
 # =========================
 _DEFAULT_TEXTS = {
     "welcome_text": "Привет, {name}! Добро пожаловать к нам. 😊\nПодскажи, сколько тебе лет?",
     "consent_text": "Отлично! {age} — прекрасный возраст.\n\nЧтобы мы могли добавить тебя в списки и дать доступ, готов(а) заполнить небольшую анкету?",
-    "questionnaire_text": "📝 <b>Шаблон анкеты участника:</b>\n\n1. Как тебя зовут?\n2. Из какого ты города?\n3. Чем увлекаешься?\n\n<i>Скопируй этот текст, заполни свои данные и отправь прямо сюда в чат!</i>",
-    "decline_text": "Без проблем! Если позже передумаешь, просто напиши команду /bv в этот чат.",
 }
 
 _DEFAULT_SETTINGS = {
@@ -149,7 +140,6 @@ router = Router()
 class Onboarding(StatesGroup):
     waiting_for_age = State()
     waiting_for_consent = State()
-    waiting_for_questionnaire = State()
 
 
 class AdminStates(StatesGroup):
@@ -214,14 +204,6 @@ def level_value() -> int:
         return 1
 
 
-def bot_is_off_message() -> str:
-    return (
-        "Бот сейчас не работает.\n"
-        f"Время: {settings_data['work_start']} - {settings_data['work_end']}\n"
-        "Попробуй позже."
-    )
-
-
 async def typed_delay():
     d = int(settings_data.get("reply_delay", 0))
     if d > 0:
@@ -234,10 +216,6 @@ def user_profile_link(user_id: int, full_name: str | None) -> str:
 
 
 async def build_message_link_safe(message: Message) -> str:
-    """
-    Корректная ссылка на сообщение даже для супергрупп без @username:
-    https://t.me/c/<internal_id>/<message_id>
-    """
     chat = message.chat
     chat_id = message.chat.id
 
@@ -278,7 +256,7 @@ def is_refusal(text: str) -> bool:
 
 
 # =========================
-# BAN & CLEANUP
+# BAN & FAILURES
 # =========================
 async def do_ban(message: Message, reason: str):
     chat_id, user_id = message.chat.id, message.from_user.id
@@ -326,18 +304,23 @@ async def safe_delete(chat_id: int, message_id: int):
             pass
 
 
-async def ban_with_cleanup(message: Message, reason: str, state: FSMContext):
-    chat_id = message.chat.id
-    data = await state.get_data()
+async def handle_user_failure(message: Message, state: FSMContext, reason: str):
+    """Молча завершает процесс опроса и оповещает администраторов об отказе/ошибке"""
+    profile_link = user_profile_link(message.from_user.id, message.from_user.full_name)
+    msg_link = await build_message_link_safe(message)
 
-    to_del = set((data.get("user_message_ids", []) or []) + (data.get("bot_message_ids", []) or []))
-    to_del.update([data.get("joined_message_id"), data.get("welcome_message_id")])
+    for admin_id in get_notify_admins():
+        try:
+            await bot.send_message(
+                admin_id,
+                f"⚠️ <b>Анкетирование прервано</b>\n\n"
+                f"Причина: <b>{reason}</b>\n"
+                f"Пользователь: {profile_link}\n"
+                f"Ссылка на сообщение: {msg_link}"
+            )
+        except:
+            continue
 
-    for mid in filter(None, to_del):
-        await safe_delete(chat_id, mid)
-
-    await safe_delete(chat_id, message.message_id)
-    await do_ban(message, reason)
     await state.clear()
 
 
@@ -390,6 +373,7 @@ async def left_chat_member_handler(message: Message):
 
 @router.message(Onboarding.waiting_for_age)
 async def process_age_any_text(message: Message, state: FSMContext):
+    """ШАГ 1: Обработка возраста пользователя"""
     if not is_time_active_now():
         await state.clear()
         return
@@ -401,7 +385,7 @@ async def process_age_any_text(message: Message, state: FSMContext):
         return
 
     if message.text and is_refusal(message.text):
-        await ban_with_cleanup(message, "Отказ назвать возраст", state)
+        await handle_user_failure(message, state, "Отказ назвать возраст")
         return
 
     text = (message.text or "").strip()
@@ -413,8 +397,9 @@ async def process_age_any_text(message: Message, state: FSMContext):
         return
 
     age = int(m.group(1))
+    
     if age < 18 or age >= 70:
-        await ban_with_cleanup(message, f"Возраст вне диапазона: {age}", state)
+        await handle_user_failure(message, state, f"Возраст вне диапазона: {age}")
         return
 
     if level_value() == 1:
@@ -422,12 +407,14 @@ async def process_age_any_text(message: Message, state: FSMContext):
         return
 
     await typed_delay()
+    
     await message.reply(get_texts()["consent_text"].format(age=age))
     await state.set_state(Onboarding.waiting_for_consent)
 
 
 @router.message(Onboarding.waiting_for_consent)
 async def process_consent_any_text(message: Message, state: FSMContext):
+    """ШАГ 2: Обработка согласия на заполнение анкеты"""
     if not is_time_active_now():
         await state.clear()
         return
@@ -445,75 +432,28 @@ async def process_consent_any_text(message: Message, state: FSMContext):
     positive_words = {"да", "давай", "ок", "окей", "хочу", "конечно", "готов", "+"}
     is_agreed = any(w in text for w in positive_words)
 
-    await typed_delay()
-
+    # Если пользователь отказался
     if not is_agreed:
-        await message.reply(get_texts()["decline_text"])
-        await state.clear()
+        await handle_user_failure(message, state, "Отказ от заполнения анкеты")
         return
 
-    if level_value() == 2:
-        await state.clear()
-        return
-
-    await message.reply(get_texts()["questionnaire_text"])
-    await state.set_state(Onboarding.waiting_for_questionnaire)
-
-
-@router.message(Onboarding.waiting_for_questionnaire)
-async def process_questionnaire_done_any_text(message: Message, state: FSMContext):
-    if not is_time_active_now():
-        await state.clear()
-        return
-
-    await track_user_message_id(message, state)
-
-    if await maybe_ban_on_suspicious_links(message):
-        await state.clear()
-        return
-
-    if message.text and is_refusal(message.text):
-        await ban_with_cleanup(message, "Отказ заполнять анкету", state)
-        return
+    # Оповещение администраторов о согласии
+    profile_link = user_profile_link(message.from_user.id, message.from_user.full_name)
+    msg_link = await build_message_link_safe(message)
 
     for admin_id in get_notify_admins():
         try:
             await bot.send_message(
                 admin_id,
-                f"✅ Анкета заполнена\n\n"
-                f"Пользователь: @{message.from_user.username or message.from_user.id}\n"
-                f"Чат: {message.chat.title}",
+                f"✅ <b>Пользователь согласился заполнить анкету</b>\n\n"
+                f"Пользователь: {profile_link}\n"
+                f"Ссылка на сообщение: {msg_link}"
             )
         except:
             continue
 
-    await message.reply("Отлично! Анкета принята.")
+    # Бот молча завершает работу с этим пользователем (никаких сообщений в ответ)
     await state.clear()
-
-
-# =========================
-# ✅ COMMAND /bv (FIX: анти-дабл)
-# Пользователям уровень НЕ влияет.
-# Запрет только нашему аккаунту (bot.id).
-# =========================
-@router.message(Command("bv"))
-async def bv_cmd(message: Message):
-    global _last_bv_update_id
-
-    # блокируем обработку одинакового update_id
-    if _last_bv_update_id == message.update_id:
-        return
-    _last_bv_update_id = message.update_id
-
-    # запрет только нашему боту
-    if message.from_user and message.from_user.id == bot.id:
-        return await message.reply("⛔ Нашему боту нельзя использовать команду /bv.")
-
-    if not is_time_active_now():
-        return await message.reply(bot_is_off_message())
-
-    await typed_delay()
-    await message.reply(get_texts()["questionnaire_text"])
 
 
 # =========================
@@ -743,7 +683,6 @@ async def admin_texts_menu(message: Message, state: FSMContext):
     kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="1"), KeyboardButton(text="2")],
-            [KeyboardButton(text="3"), KeyboardButton(text="4")],
             [KeyboardButton(text=BTN_BACK)]
         ],
         resize_keyboard=True,
@@ -751,15 +690,13 @@ async def admin_texts_menu(message: Message, state: FSMContext):
     await message.reply(
         "Выбери текст для изменения:\n"
         "1) Приветствие (welcome_text)\n"
-        "2) Согласие (consent_text)\n"
-        "3) Анкета (questionnaire_text)\n"
-        "4) Отказ (decline_text)",
+        "2) Согласие (consent_text)",
         reply_markup=kb,
     )
 
-@router.message(AdminStates.texts_menu, F.text.in_(["1", "2", "3", "4"]))
+@router.message(AdminStates.texts_menu, F.text.in_(["1", "2"]))
 async def admin_texts_pick(message: Message, state: FSMContext):
-    mapping = {"1": "welcome_text", "2": "consent_text", "3": "questionnaire_text", "4": "decline_text"}
+    mapping = {"1": "welcome_text", "2": "consent_text"}
     key = mapping[message.text]
     await state.update_data(_text_key=key)
     await state.set_state(AdminStates.edit_text_value)
