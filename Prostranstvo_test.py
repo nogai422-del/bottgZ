@@ -7,7 +7,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, time as dtime
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -15,7 +15,7 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import (
     Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
-    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
 )
 
 # =========================
@@ -56,7 +56,7 @@ _DEFAULT_SETTINGS = {
     "work_start": "07:00",
     "work_end": "19:00",
     "is_active": True,
-    "allow_admins_edit": True, # Разрешено ли обычным админам менять настройки
+    "allow_admins_edit": True,
     "notify_admins": [OWNER_ID],
     "texts": dict(_DEFAULT_TEXTS),
 }
@@ -139,6 +139,26 @@ members_data = load_members()
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 router = Router()
+
+# =========================
+# TRACKING MIDDLEWARE (Слухач)
+# =========================
+class TrackMembersMiddleware(BaseMiddleware):
+    """Скрытно записывает старых участников, когда они пишут в чат"""
+    async def __call__(self, handler, event, data):
+        if isinstance(event, Message) and event.chat and event.chat.type in ("group", "supergroup"):
+            if event.from_user and not event.from_user.is_bot:
+                uid = str(event.from_user.id)
+                if uid not in members_data:
+                    # Записываем старого участника (без таймера join_ts = None)
+                    members_data[uid] = {
+                        "name": event.from_user.full_name,
+                        "join_ts": None
+                    }
+                    save_members(members_data)
+        return await handler(event, data)
+
+router.message.middleware(TrackMembersMiddleware())
 
 # =========================
 # STATES
@@ -228,6 +248,18 @@ def format_time_diff(ts: float) -> str:
     years = months // 12
     return f"{years} лет {months % 12} мес."
 
+async def get_user_display_name(user_id: int) -> str:
+    try:
+        chat = await bot.get_chat(user_id)
+        name = chat.first_name or chat.title or "Unknown"
+        if getattr(chat, "last_name", None):
+            name += f" {chat.last_name}"
+        if getattr(chat, "username", None):
+            return f"{name} (@{chat.username})"
+        return name
+    except Exception:
+        return f"ID: {user_id}"
+
 # =========================
 # BAN & FAILURES
 # =========================
@@ -266,14 +298,14 @@ async def handle_user_failure(message: Message, state: FSMContext, reason: str):
     await state.clear()
 
 # =========================
-# USER FLOW
+# USER FLOW (GROUP ACTIONS)
 # =========================
 @router.message(F.new_chat_members)
 async def welcome_new_member(message: Message):
     for new_member in message.new_chat_members:
         if new_member.id == bot.id: continue
         
-        # Сохраняем в базу участников
+        # Добавляем с таймером
         members_data[str(new_member.id)] = {
             "name": new_member.full_name,
             "join_ts": time.time()
@@ -290,9 +322,11 @@ async def welcome_new_member(message: Message):
 
 @router.message(F.left_chat_member)
 async def left_chat_member_handler(message: Message):
+    # Убираем системное сообщение
     try: await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
     except: pass
-    # Удаляем из базы
+    
+    # Исключаем из базы покинувшего участника
     uid_str = str(message.left_chat_member.id)
     if uid_str in members_data:
         del members_data[uid_str]
@@ -371,7 +405,7 @@ def admin_main_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="👥 Админы"), KeyboardButton(text="🔔 Оповещения")],
-            [KeyboardButton(text="👥 Участники (Трекинг)")],
+            [KeyboardButton(text="👥 Участники (Текущие)")],
             [KeyboardButton(text="🟢 Бот ON/OFF"), KeyboardButton(text="🏷️ Уровни 1/2/3")],
             [KeyboardButton(text="🕒 Время работы"), KeyboardButton(text="⏱️ Задержка")],
             [KeyboardButton(text="📝 Тексты"), KeyboardButton(text="🧾 Логи")],
@@ -410,26 +444,65 @@ async def admin_open_panel(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id): return await message.reply("⛔ Нет доступа.")
     await show_admin_menu(message, state)
 
-# УЧАСТНИКИ (ТРЕКИНГ)
-@router.message(AdminStates.menu, F.text == "👥 Участники (Трекинг)")
+# УЧАСТНИКИ (ОБНОВЛЕННЫЙ ТРЕКИНГ)
+@router.message(AdminStates.menu, F.text == "👥 Участники (Текущие)")
 async def admin_view_members(message: Message):
     if not members_data:
-        return await message.reply("Пока никто не присоединялся с момента запуска отслеживания.")
+        return await message.reply("База участников пуста. Бот начнет запоминать их, как только кто-то напишет сообщение или зайдет в группу.")
     
-    lines = []
-    for uid, info in sorted(members_data.items(), key=lambda x: x[1]['join_ts']):
-        t_diff = format_time_diff(info['join_ts'])
-        name = info['name']
-        lines.append(f"• <a href='tg://user?id={uid}'>{name}</a> — <i>{t_diff}</i>")
+    tracked = []
+    untracked = []
     
-    text = "👥 <b>Отслеживаемые новые участники:</b>\n\n" + "\n".join(lines)
-    if len(text) > 4000: text = text[:3900] + "\n... (список обрезан)"
-    await message.reply(text)
+    for uid, info in members_data.items():
+        name = info.get("name", "Без имени")
+        ts = info.get("join_ts")
+        if ts:
+            diff = format_time_diff(ts)
+            tracked.append((name, uid, diff))
+        else:
+            untracked.append((name, uid))
+            
+    # Формируем текст
+    html_lines = []
+    if tracked:
+        html_lines.append("<b>🕒 С таймером (Новые):</b>")
+        for name, uid, diff in tracked:
+            html_lines.append(f"• <a href='tg://user?id={uid}'>{name}</a> — <i>{diff}</i>")
+            
+    if untracked:
+        if tracked: html_lines.append("")
+        html_lines.append("<b>👥 Без таймера (Старые участники):</b>")
+        for name, uid in untracked:
+            html_lines.append(f"• <a href='tg://user?id={uid}'>{name}</a>")
+            
+    full_text = "👥 <b>Актуальный список участников:</b>\n\n" + "\n".join(html_lines)
+    
+    # Если текст помещается в лимит Телеграма
+    if len(full_text) <= 4000:
+        await message.reply(full_text)
+    else:
+        # Если людей слишком много, создаем файл
+        txt_lines = ["АКТУАЛЬНЫЙ СПИСОК УЧАСТНИКОВ\n", "--- С таймером (Новые) ---"]
+        for name, uid, diff in tracked:
+            txt_lines.append(f"{name} (ID: {uid}) — В группе: {diff}")
+            
+        txt_lines.append("\n--- Без таймера (Старые участники) ---")
+        for name, uid in untracked:
+            txt_lines.append(f"{name} (ID: {uid})")
+            
+        file_bytes = "\n".join(txt_lines).encode("utf-8")
+        doc = BufferedInputFile(file_bytes, filename="Участники.txt")
+        await message.reply_document(doc, caption="Список слишком большой, поэтому он выгружен в этот файл.")
 
 # АДМИНЫ
 @router.message(AdminStates.menu, F.text == "👥 Админы")
 async def admin_admins_menu(message: Message, state: FSMContext):
-    lines = [f"• <code>{aid}</code> {'(Создатель)' if aid == OWNER_ID else ''}" for aid in ADMIN_USER_IDS]
+    lines = []
+    for aid in ADMIN_USER_IDS:
+        name = await get_user_display_name(aid)
+        role = " <b>(Создатель)</b>" if aid == OWNER_ID else ""
+        lines.append(f"• {name} <code>({aid})</code>{role}")
+
     kb = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Добавить админа"), KeyboardButton(text="➖ Удалить админа")],
         [KeyboardButton(text=BTN_BACK)]
@@ -470,29 +543,37 @@ async def admin_remove_finish(message: Message, state: FSMContext):
     await show_admin_menu(message, state)
 
 # ОПОВЕЩЕНИЯ (ИНЛАЙН КНОПКИ)
-def notify_kb():
-    notified = get_notify_admins()
+async def build_notify_kb() -> InlineKeyboardMarkup:
+    notified = set(get_notify_admins())
     buttons = []
     for aid in ADMIN_USER_IDS:
         status = "🔔" if aid in notified else "🔕"
-        buttons.append([InlineKeyboardButton(text=f"{status} ID: {aid}", callback_data=f"notif_{aid}")])
+        name = await get_user_display_name(aid)
+        btn_text = f"{status} {name}"
+        if len(btn_text) > 40: btn_text = btn_text[:37] + "..."
+        buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"notif_{aid}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 @router.message(AdminStates.menu, F.text == "🔔 Оповещения")
 async def admin_notify_menu(message: Message):
     if not await check_edit_rights(message): return
-    await message.reply("Кликай по кнопкам, чтобы включить 🔔 или выключить 🔕 оповещения для админов:", reply_markup=notify_kb())
+    kb = await build_notify_kb()
+    await message.reply("Кликай по кнопкам, чтобы включить 🔔 или выключить 🔕 оповещения для админов:", reply_markup=kb)
 
 @router.callback_query(F.data.startswith("notif_"))
 async def toggle_notif_cb(call: CallbackQuery):
     if not can_edit_settings(call.from_user.id): return await call.answer("Отказано", show_alert=True)
+    
     aid = int(call.data.split("_")[1])
     notified = set(get_notify_admins())
     if aid in notified: notified.remove(aid)
     else: notified.add(aid)
+    
     settings_data["notify_admins"] = list(notified)
     save_settings(settings_data)
-    await call.message.edit_reply_markup(reply_markup=notify_kb())
+    
+    kb = await build_notify_kb()
+    await call.message.edit_reply_markup(reply_markup=kb)
     await call.answer()
 
 # НАСТРОЙКИ 
