@@ -158,7 +158,7 @@ class TrackMembersMiddleware(BaseMiddleware):
                     save_members(members_data)
         return await handler(event, data)
 
-router.message.middleware(TrackMembersMiddleware())
+dp.message.outer_middleware(TrackMembersMiddleware())
 
 # =========================
 # STATES
